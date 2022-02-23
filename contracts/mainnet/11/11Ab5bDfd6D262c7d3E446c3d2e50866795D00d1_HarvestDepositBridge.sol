@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity ^0.8.6;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./interfaces/IHarvestVault.sol";
+import "./interfaces/IHarvestPool.sol";
+import "../interfaces/IHarvestDeposit.sol";
+
+/**
+ * @title HarvestDepositBridge
+ * @author DeFi Basket
+ *
+ * @notice Deposits, withdraws and harvest rewards from harvest vaults in Polygon.
+ *
+ * @dev This contract has 2 main functions:
+ *
+ * 1. Deposit in Harvest vault and stake fASSET in corresponding pool
+ * 2. Withdraw from Harvest vault and claim rewards
+ *
+ */
+
+contract HarvestDepositBridge is IHarvestDeposit {
+
+    /**
+      * @notice Deposits into a Harvest vault and automatically stakes in the corresponding pool
+      *
+      * @dev Wraps the Harvest vault deposit and pool stake. Also generates the necessary events to communicate with DeFi Basket's UI and back-end.
+      *
+      * @param poolAddress The address of the Harvest pool.
+      * @param percentageIn Percentage of the balance of the asset that will be deposited
+      */
+    function deposit(address poolAddress, uint256 percentageIn) external override {
+
+        address vaultAddress = IHarvestPool(poolAddress).lpToken(); /* lpToken returns the proxy (and not the implementation address) */        
+        IHarvestVault vault = IHarvestVault(vaultAddress);
+
+        IERC20 assetIn = IERC20(vault.underlying());        
+        uint256 amountIn = assetIn.balanceOf(address(this)) * percentageIn / 100000;
+
+        // Approve 0 first as a few ERC20 tokens are requiring this pattern.
+        assetIn.approve(vaultAddress, 0);
+        assetIn.approve(vaultAddress, amountIn);
+
+        vault.deposit(amountIn);
+
+        // Stake token in reward pool
+        IERC20 vaultToken = IERC20(vaultAddress);
+        uint256 vaultTokenBalance = vaultToken.balanceOf(address(this));
+        vaultToken.approve(poolAddress, vaultTokenBalance);                
+        IHarvestPool(poolAddress).stake(vaultTokenBalance);
+
+        emit DEFIBASKET_HARVEST_DEPOSIT(address(assetIn), amountIn, vaultTokenBalance);
+    }
+
+    /**
+      * @notice Withdraws from the Harvest vault.
+      *
+      * @dev Wraps the Harvest vault withdraw and the pool exit. Also generates the necessary events to communicate with DeFi Basket's UI and back-end.
+      *
+      * @param poolAddress The address of the Harvest pool.
+      * @param percentageOut Percentage of fAsset that will be withdrawn
+      *
+      */
+    function withdraw(address poolAddress, uint256 percentageOut) external override { 
+
+        address vaultAddress = IHarvestPool(poolAddress).lpToken(); /* lpToken returns the proxy (and not the implementation address) */        
+        IHarvestVault vault = IHarvestVault(vaultAddress);          
+        
+        IHarvestPool pool = IHarvestPool(poolAddress);
+        IERC20 assetOut = IERC20(vault.underlying());
+                
+        // Compute balance of reward tokens before exit is called 
+        uint256 rewardTokensLength = pool.rewardTokensLength();
+        address[] memory rewardTokens = new address[](rewardTokensLength);        
+        uint256[] memory rewardBalances = new uint256[](rewardTokensLength);
+        uint256[] memory rewardBalancesOut = new uint256[](rewardTokensLength);
+
+        for(uint256 i = 0; i < rewardTokensLength; i = unchecked_inc(i)) { 
+          rewardTokens[i] = pool.rewardTokens(i);
+          rewardBalances[i] = IERC20(rewardTokens[i]).balanceOf(address(this));            
+        }
+
+        // Returns the staked fASSET to the Wallet in addition to any accumulated FARM rewards
+        pool.exit();
+
+        // Burn fASSET and withdraw corresponding asset from Vault 
+        IERC20 vaultToken = IERC20(vaultAddress);
+        uint256 assetBalanceBefore = assetOut.balanceOf(address(this));
+        uint256 assetAmountIn = vaultToken.balanceOf(address(this)) * percentageOut / 100000;
+        vault.withdraw(assetAmountIn);
+        uint256 assetAmountOut = assetOut.balanceOf(address(this)) - assetBalanceBefore;
+
+        // Compute total rewards for each reward token
+        for(uint256 i = 0; i < rewardTokensLength; i = unchecked_inc(i)) {
+          rewardBalancesOut[i] = IERC20(rewardTokens[i]).balanceOf(address(this)) - rewardBalances[i];            
+        }
+
+        emit DEFIBASKET_HARVEST_WITHDRAW(address(assetOut), assetAmountOut, assetAmountIn, rewardTokens, rewardBalancesOut);
+    }
+
+    
+    /**
+      * @notice Claim rewards from a pool without unstaking the fASSET
+      *
+      * @dev Wraps the Harvest getAllRewards and generate the necessary events to communicate with DeFi Basket's UI and
+      * back-end. 
+      *
+      * @param poolAddress The address of the Harvest pool.
+      *
+      */    
+    function claimRewards(address poolAddress) external override { 
+
+        IHarvestPool pool = IHarvestPool(poolAddress);
+                
+        // Compute balance of reward tokens before exit is called 
+        uint256 rewardTokensLength = pool.rewardTokensLength();
+        address[] memory rewardTokens = new address[](rewardTokensLength);
+        uint256[] memory rewardBalances = new uint256[](rewardTokensLength);
+        uint256[] memory rewardBalancesOut = new uint256[](rewardTokensLength);
+        
+        for(uint256 i = 0; i < rewardTokensLength; i = unchecked_inc(i)) {
+          rewardTokens[i] = pool.rewardTokens(i);
+          rewardBalances[i] = IERC20(rewardTokens[i]).balanceOf(address(this));            
+        }
+        
+        pool.getAllRewards();
+
+        // Compute total rewards for each reward token
+        for(uint256 i = 0; i < rewardTokensLength; i = unchecked_inc(i)) {
+          rewardBalancesOut[i] = IERC20(rewardTokens[i]).balanceOf(address(this)) - rewardBalances[i];            
+        }
+
+        emit DEFIBASKET_HARVEST_CLAIM(rewardTokens, rewardBalancesOut);        
+    }
+
+    /**
+      * @notice Increment integer without checking for overflow - only use in loops where you know the value won't overflow
+      *
+      * @param i Integer to be incremented
+    */
+    function unchecked_inc(uint256 i) internal pure returns (uint256) {
+        unchecked {
+            return i + 1;
+        }
+    }    
+    
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity ^0.8.6;
+
+interface IHarvestVault {
+
+    function deposit(uint256 amount) external;
+    function withdraw(uint256 numberOfShares) external; 
+    function underlying() external view returns(address);
+
+}
+
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity ^0.8.6;
+
+interface IHarvestPool {
+    
+    function lpToken() external returns (address);
+    function rewardTokens(uint i) external returns (address);
+    function rewardTokensLength() external returns(uint256);    
+    function getAllRewards() external; 
+    function stake(uint256 amount) external;
+    function exit() external;
+
+}
+
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pragma solidity ^0.8.6;
+
+interface IHarvestDeposit {
+    event DEFIBASKET_HARVEST_DEPOSIT(
+        address assetIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    event DEFIBASKET_HARVEST_WITHDRAW(
+        address assetOut,
+        uint256 assetAmountOut,
+        uint256 assetAmountIn,
+        address[] rewardTokens,
+        uint256[] rewardBalancesOut
+    );
+
+    event DEFIBASKET_HARVEST_CLAIM(
+        address[] rewardTokens,
+        uint256[] rewardBalancesOut
+    );
+
+    function deposit(address poolAddress, uint256 percentageIn) external;
+    function withdraw(address poolAddress, uint256 percentageOut) external;
+    function claimRewards(address poolAddress) external;
+}
