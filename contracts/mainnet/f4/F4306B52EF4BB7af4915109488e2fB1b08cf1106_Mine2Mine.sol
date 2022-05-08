@@ -1,0 +1,190 @@
+pragma solidity ^0.8.0;
+
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+contract Mine2Mine {
+
+  struct Submission {
+    address creator;
+    string ipfsHash;
+    bool verified;
+  }
+
+  struct Task {
+    address creator;
+    string text;
+    uint256 bid;
+    uint256 expiresAt;
+    uint256 originalQuantity;
+    uint256 remainingQuantity;
+    uint256 numberOfSubmissions;
+    mapping(uint256 => Submission) submissions;
+  }
+
+  event TaskCreated(
+    uint256 taskId,
+    address creator,
+    string text,
+    uint256 bid,
+    uint256 expiresAt,
+    uint256 quantity
+    );
+
+  event SubmissionCreated(
+    uint256 taskId,
+    uint256 submissionId,
+    address creator,
+    string ipfsHash,
+    bool verified
+    );
+
+  event SubmissionVerified(
+    uint256 taskId,
+    uint256 submissionId,
+    address creator,
+    string ipfsHash,
+    bool verified
+    );
+
+  uint256 numberOfTasks;
+  mapping(uint256 => Task) tasks;
+
+  IERC20 USDC = IERC20(0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174);
+
+  address VERIFIER = 0xF3Bd0DD9C19978b54F09F97F4A1b8eE28Eddb1B4;
+
+  function createTask(string calldata text, uint256 bid, uint256 expiresAt, uint256 quantity) external returns(uint256) {
+    require(bid > 0);
+    require(expiresAt > block.timestamp);
+    require(quantity > 0);
+
+    numberOfTasks += 1;
+    uint256 taskId = numberOfTasks;
+    Task storage task = tasks[taskId];
+    task.creator = msg.sender;
+    task.text = text;
+    task.bid = bid;
+    task.expiresAt = expiresAt;
+    task.originalQuantity = quantity;
+    task.remainingQuantity = quantity;
+
+    emit TaskCreated(taskId, msg.sender, text, bid, expiresAt, quantity);
+
+    return taskId;
+  }
+
+  function createSubmission(uint256 taskId, string calldata ipfsHash) external returns(uint256) {
+    require(tasks[taskId].remainingQuantity > 0);
+
+    Task storage task = tasks[taskId];
+
+    task.numberOfSubmissions += 1;
+    uint256 submissionId = task.numberOfSubmissions;
+
+    Submission storage submission = task.submissions[submissionId];
+    submission.creator = msg.sender;
+    submission.ipfsHash = ipfsHash;
+
+    task.remainingQuantity -= 1;
+
+    emit SubmissionCreated(taskId, submissionId, msg.sender, ipfsHash, false);
+
+    return submissionId;
+  }
+
+  function verifySubmission(uint256 taskId, uint256 submissionId) external {
+    require(msg.sender == VERIFIER);
+    Task storage task = tasks[taskId];
+    Submission storage submission = task.submissions[submissionId];
+    require(submission.creator > address(0));
+    submission.verified = true;
+
+    // here, we transfer `task.bid` of USDC from `task.creator` to `msg.sender`
+    USDC.transferFrom(task.creator, submission.creator, task.bid);
+
+    emit SubmissionVerified(taskId, submissionId, submission.creator, submission.ipfsHash, true);
+  }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
