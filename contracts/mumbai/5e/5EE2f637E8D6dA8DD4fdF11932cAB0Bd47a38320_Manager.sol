@@ -1,0 +1,3793 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "Block.sol";
+import "Post.sol";
+import "User.sol";
+import "DAO.sol";
+import "Ownable.sol";
+import "Strings.sol";
+import "VRFConsumerBaseV2.sol";
+import "VRFCoordinatorV2Interface.sol";
+
+contract Manager is Ownable, VRFConsumerBaseV2 {
+    Block blcks;
+    NTBlock ntblcks;
+    Post posts;
+    User users;
+    DAO dao;
+
+    enum Quests {
+        vote,
+        post,
+        comment,
+        follow,
+        end 
+    }
+
+    struct Weights {
+        uint256 proposalVote;
+        uint256 upvoteComment;
+        uint256 downvoteComment;
+        uint256 upvotePost;
+        uint256 downvotePost;
+        uint256 follow;
+        uint256 unFollow;
+        uint256 comment;
+        uint256 stake;
+        uint256 post;
+        uint256 propose;
+        uint256 mintUser;
+    }
+
+    struct Activity {
+        uint parent;
+        uint postId;
+        uint amount;
+        uint child;
+    }
+
+    address public communityWallet;
+    address public devWallet;
+    uint public devFee;
+    uint public numDigits = 10**(9-1);
+    uint public targetPercentageRewardPerDay = (1 * numDigits) / 100;
+
+    // Weights are how much interactions cost as well as how much weight they have in rewards
+    Weights public weights = Weights(1, 1, 1, 5, 5, 50, 25, 200, 200, 1000, 5000, 50000);
+    // Gas fee starts at 1 and increases based on site usage
+    uint public gasFee = 1;
+    // activity tracker is reset each blockSize and the top posts are rewarded
+    Activity public activityHead;
+    Activity public activityBottom;
+    mapping(uint => mapping(uint => Activity)) public postIdToActivity;
+    mapping(uint => uint) public totalActivity;
+    mapping(uint => uint) public numActivities;
+
+    uint public topRewardPercentage = (numDigits * 25) / 100;
+    uint public numPostsToReward = 10;
+    uint public prevIter;
+    uint public blockConstructed;
+    uint public blockOfLastPost;
+    uint public blocksInADay = 43000;
+    uint public blockSize = 5;
+    uint public prevTargetReward;
+    uint public adjustmentPercentage = (125 * numDigits) / 1000;
+    mapping(uint => uint) public blockToPostCount;
+
+    // chainlink variables
+    uint256 public randomness;
+    uint256 public fee;
+    bytes32 public keyhash;
+    event RequestedRandomness(uint256 requestId);
+    mapping(uint256 => uint) requestIdToUserId;
+    VRFCoordinatorV2Interface COORDINATOR;
+    uint64 s_subscriptionId;
+    uint32 callbackGasLimit = 40000;
+    uint16 requestConfirmations = 3;
+    event randomnessFullfilled(uint userId, uint indexOfQuest);
+
+    constructor(
+        Block _blcks,
+        NTBlock _ntblcks,
+        Post _posts,
+        User _users,
+        DAO _dao,
+        address _communityWallet,
+        address _devWallet,
+        address _vrfCoordinator,
+        bytes32 _keyhash, 
+        uint64 _s_subscriptionId
+    ) VRFConsumerBaseV2(_vrfCoordinator) {
+        blcks = _blcks;
+        ntblcks = _ntblcks;
+        posts = _posts;
+        users = _users;
+        dao = _dao;
+        communityWallet = _communityWallet;
+        devWallet = _devWallet;
+        devFee = 25;
+
+        blockConstructed = block.number;
+        prevIter = block.number;
+
+        // chainlink
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
+        keyhash = _keyhash;
+        s_subscriptionId = _s_subscriptionId;
+    }
+
+    function setDailyQuest(uint userId) public {
+        uint256 requestId = COORDINATOR.requestRandomWords(
+            keyhash,
+            s_subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            1
+        );
+        requestIdToUserId[requestId] = userId;
+        emit RequestedRandomness(requestId);
+    }
+
+    function fulfillRandomWords(uint256 _requestId, uint256[] memory _randomness)
+        internal
+        override
+    {
+        require(_randomness[0] > 0, "random-not-found");
+        uint256 indexOfQuest = _randomness[0] % uint(Quests.end);
+        uint userId = requestIdToUserId[_requestId];
+        users.setUserQuest(userId, indexOfQuest);
+        randomness = _randomness[0];
+        emit randomnessFullfilled(userId, indexOfQuest);
+    }
+
+    function setWeights(Weights memory _weights) public onlyOwner {
+        weights = _weights;
+    }
+
+    function getWeights() public view returns(Weights memory) {
+        return weights;
+    }
+
+    function getTargetReward() public view returns(uint) {
+        return targetPercentageRewardPerDay * blcks.totalSupply() / blocksInADay / blockSize / numDigits;
+    }
+
+    function replenishUserNTBlocks(uint userId, address sender) public {
+        (uint level,) = users.getLevelAndExpNeeded(userId);
+        ntblcks.mint(sender, level * 5000);
+    }
+
+    event test(uint postReward, uint blockReward, uint activityAmount, uint topRewardPercentage, uint count);
+    function rewardBlock(uint iter) public {
+        uint blockReward = getTargetReward();
+
+        Activity memory activity = activityHead;
+        if (activity.child == 0) {
+            // no activity this block
+            if (gasFee == 1) {
+                // mint surplus as ntblck to community wallet
+                ntblcks.mint(communityWallet, blockReward);
+            } else {
+                // reduce gas fee
+                gasFee *= (numDigits - adjustmentPercentage);
+                if (gasFee < 1) {
+                    gasFee = 1;
+                }
+            }
+        } else {
+            // Reward the top rewardPercentage of activity
+            uint rewardedActivity = 0; 
+            uint rewardedPercentage = 0;
+            uint count = 0;
+            while (rewardedPercentage < topRewardPercentage && activity.child != 0) {
+                rewardedActivity += activity.amount;
+                rewardedPercentage = (numDigits * rewardedActivity) / totalActivity[iter];
+
+                uint postReward = (blockReward * activity.amount * numDigits) / topRewardPercentage;
+                posts.rewardPost(activity.postId, postReward);
+                activity = postIdToActivity[iter][activity.child];
+                count++;
+                emit test(postReward, blockReward, activity.amount, topRewardPercentage, count);
+            }
+
+            // If percentage of posts not getting paid is too high then increase gas fee
+            if ((count * numDigits) / numActivities[iter] < (25 * numDigits) / 100) {
+                gasFee *= (numDigits + adjustmentPercentage);
+            }
+        }
+    }
+
+    function orderActivity(Activity memory activity, uint iter) public {
+        Activity memory activityParent;
+        while (activity.parent != 0 && activity.amount > activityParent.amount) {
+            activityParent = postIdToActivity[iter][activity.parent];
+            // Swap ids and children
+            postIdToActivity[iter][activity.parent].parent = activity.parent;
+            postIdToActivity[iter][activity.parent].child = activity.child;
+
+            postIdToActivity[iter][activity.postId].parent = activityParent.parent;
+            postIdToActivity[iter][activity.postId].child = activityParent.child;
+
+            if (activity.child == 0) {
+                activityBottom = activityParent;
+            }
+            activity =  postIdToActivity[iter][activity.parent];
+        }
+        if (activity.parent == 0) {
+            activityHead = activity;
+        }
+    }
+
+
+    function updateActivity(uint postId, uint weight, uint userScore) public {
+        uint iter = (block.number - blockConstructed) / blockSize;
+        for (uint256 i; i < iter; i++) {
+            rewardBlock(iter);
+        }
+
+        Activity memory activity = postIdToActivity[iter][postId];
+        
+        if (activity.parent == 0 && activity.child == 0) {
+            // activity doesnt exist yet
+            numActivities[iter]++;
+            if (numActivities[iter] == 1) {
+                // first activity this block
+                activity = Activity(0, postId, weight * userScore, 0);
+                postIdToActivity[iter][postId] = activity;
+                activityHead = activity;
+                activityBottom = activity;
+            } else {
+                activity = Activity(activityBottom.postId, postId, weight * userScore, 0);
+                postIdToActivity[iter][postId] = activity;
+                orderActivity(activity, iter);
+            }
+        } else {
+            postIdToActivity[iter][postId].amount += weight * userScore;
+            orderActivity(activity, iter);
+        }
+        totalActivity[iter] += weight * userScore;
+    }
+
+    // check user has funds and if so sends them
+    modifier sendFunds(uint256 cost, address sender) {
+        uint bBlckBalance = ntblcks.balanceOf(sender);
+        uint blcksBalance = blcks.balanceOf(sender);
+        require(bBlckBalance + blcksBalance >= cost,  "You do not have enough tokens to do that");
+
+        if (bBlckBalance >= cost) {
+            ntblcks.burnFrom(sender, cost);
+        } else {
+            uint amountLeft = cost - bBlckBalance;
+            if (bBlckBalance != 0) {
+                // ntblcks.approve(sender, cost);
+                ntblcks.burnFrom(sender, cost);
+            }
+
+            // Fee that goes to the devs
+            // uint fee = amountLeft * devFee / 1000;
+            // blcks.approve(sender, fee);
+            // blcks.transferFrom(sender, devWallet, fee);
+            // The rest is converted into ntblcks
+            // blcks.approve(sender, amountLeft - fee);
+            blcks.burnFrom(sender, amountLeft);
+            ntblcks.mint(communityWallet, amountLeft);
+        }
+        _;
+    }
+
+    function changeDevFee(uint _devFee) public onlyOwner {
+        devFee = _devFee;
+    }
+
+    function upvotePost(uint userIdOfInteractor, uint postId, address sender) 
+        public sendFunds(gasFee * weights.upvotePost, sender)
+    {
+        if (users.getUserQuest(userIdOfInteractor) == uint(Quests.vote)) {
+            users.addExp(1000, userIdOfInteractor, sender);
+        }
+
+        uint userScore = users.getScore(userIdOfInteractor);
+        // updateActivity(postId, weights.upvotePost, userScore);
+
+        users.addExp(weights.upvotePost, userIdOfInteractor, sender);
+        posts.voteOnInput(postId, sender, true);
+    }
+
+    function downvotePost(
+            uint userIdOfInteractor, uint postId,
+            address sender
+        ) public sendFunds(gasFee * weights.downvotePost, sender)
+    {
+        if (users.getUserQuest(userIdOfInteractor) == uint(Quests.vote)) {
+            users.addExp(1000, userIdOfInteractor, sender);
+        }
+
+        uint userScore = users.getScore(userIdOfInteractor);
+        updateActivity(postId, weights.downvotePost, userScore);
+
+        users.addExp(weights.downvotePost, userIdOfInteractor, sender);
+        posts.voteOnInput(postId, sender, false);
+    }
+
+    function upvoteComment(
+            uint userIdOfInteractor, uint commentId, uint postId,
+            address sender
+        ) public sendFunds(gasFee * weights.upvoteComment, sender) 
+    {
+        if (users.getUserQuest(userIdOfInteractor) == uint(Quests.vote)) {
+            users.addExp(1000, userIdOfInteractor, sender);
+        }
+        // uint userScore = users.getScore(userIdOfInteractor);
+        // updateActivity(postId, weights.upvoteComment, userScore);
+
+        users.addExp(weights.upvoteComment, userIdOfInteractor, sender);
+        posts.voteOnComment(commentId, sender, true);
+    }
+
+    function downvoteComment(
+            uint userIdOfInteractor, uint commentId, uint postId,
+            address sender
+        ) public sendFunds(gasFee * weights.downvoteComment, sender) 
+    {
+        if (users.getUserQuest(userIdOfInteractor) == uint(Quests.vote)) {
+            users.addExp(1000, userIdOfInteractor, sender);
+        }
+        uint userScore = users.getScore(userIdOfInteractor);
+        updateActivity(postId, weights.downvoteComment, userScore);
+
+        users.addExp(weights.downvoteComment, userIdOfInteractor, sender);
+        posts.voteOnComment(commentId, sender, false);
+    }
+
+    function mintUser(string memory userName, address sender) 
+        public sendFunds(gasFee * weights.mintUser, sender) 
+    {
+        // userIdOfInteractor is 0 if its new user. Non 0 if existing user mints a new one
+        // users.addExp(weights.mintUser, userIdOfInteractor, sender);
+        users.mintUser(userName, sender);
+    }
+
+    function follow(
+            uint256 userIdProtagonist, uint256 userIdAntagonist,
+            address sender
+        ) public 
+    {
+        if (users.getUserQuest(userIdProtagonist) == uint(Quests.follow)) {
+            users.addExp(1000, userIdProtagonist, sender);
+        }
+        // users.addExp(weights.follow, userIdProtagonist, sender);
+        users.follow(userIdProtagonist, userIdAntagonist, sender);
+    }
+
+    function unFollow(
+            uint256 userIdProtagonist, uint256 userIdAntagonist,
+            address sender
+        ) public sendFunds(gasFee * weights.unFollow, sender)
+    {
+        users.addExp(weights.unFollow, userIdProtagonist, sender);
+        users.unFollow(userIdProtagonist, userIdAntagonist, sender);
+    }
+
+    function mintPost(
+            uint userId,
+            string memory username,
+            string memory category, 
+            string memory title, 
+            string memory text, 
+            string memory link,
+            uint stakingTip,
+            bool isNSFW,
+            address sender
+        ) public sendFunds(gasFee * weights.post, sender) 
+    {    
+        if (users.getUserQuest(userId) == uint(Quests.post)) {
+            users.addExp(1000, userId, sender);
+        }
+        users.addExp(weights.post, userId, sender);
+        posts.mintPost(userId, username, category, title, text, link, sender, stakingTip, isNSFW);
+        blockOfLastPost = block.number;
+        blockToPostCount[block.number/blockSize]++;
+    }
+
+    function makeComment(
+            uint userId, 
+            string memory username,
+            string memory text, 
+            uint parentId,
+            bool onPost,
+            bool isNSFW,
+            address sender
+        ) public sendFunds(gasFee * weights.comment, sender) 
+    {
+        if (users.getUserQuest(userId) == uint(Quests.comment)) {
+            users.addExp(1000, userId, sender);
+        }
+        users.addExp(weights.comment, userId, sender);
+        posts.makeComment(userId, username, text, parentId, onPost, sender, isNSFW);
+    }
+
+    function stakeOnPost(
+            uint256 userId,
+            uint256 postId,
+            uint256 numTokens,
+            address sender
+        ) public sendFunds(gasFee * weights.stake, sender) 
+    {
+        uint userScore = users.getScore(userId);
+        updateActivity(postId, weights.stake, userScore);
+
+        users.addExp(weights.stake, userId, sender);
+        posts.stakeOnPost(userId, postId, numTokens, userScore, sender);
+    }
+
+    function mintProposal(
+        uint userId, string memory description, bytes memory parameters, 
+        string[] memory votingOptions, address sender
+    ) public sendFunds(gasFee * weights.propose, sender) 
+    {
+        users.addExp(weights.propose, userId, sender);
+        dao.mintProposal(userId, description, parameters, votingOptions, sender);
+    } 
+
+    function voteOnProposal(
+            uint proposalId, uint userId, 
+            uint optionNumber, uint numVotes,
+            address sender
+        ) public sendFunds(gasFee * weights.proposalVote, sender) 
+    {
+        users.addExp(weights.proposalVote*5, userId, sender);
+        dao.voteOnProposal(proposalId, userId, optionNumber, numVotes);
+    }
+
+    // called from bounty button
+    function implementProposal(uint userIdOfInteractor, uint proposalId, address sender) 
+        public sendFunds(gasFee * dao.getBounty(proposalId), sender) 
+    {
+        users.addExp(1000, userIdOfInteractor, sender);
+
+        (uint winningOptionId, string memory winningOption, bytes memory parameters) = dao.getPurposalResult(proposalId);
+        
+        // hard code every function DAO can call
+        bytes32 winningOptionHashed = keccak256(abi.encodePacked(winningOption));
+        if (winningOptionHashed == keccak256(abi.encodePacked("setAsNSFW"))) {
+            (uint inputId, bool onPost) = abi.decode(parameters, (uint, bool));
+            posts.setAsNSFW(inputId, onPost, sender);
+        } else if (winningOptionHashed == keccak256(abi.encodePacked("deletePost"))) {
+            (uint postId) = abi.decode(parameters, (uint));
+            posts.burn(postId);
+        } else if (winningOptionHashed == keccak256(abi.encodePacked("deleteComment"))) {
+            (uint commentId, uint postId) = abi.decode(parameters, (uint, uint));
+            posts.burnComment(commentId, postId, false, sender);
+        } 
+    }
+
+    function collectAllStakes(uint postId, address sender) public {
+        uint[] memory userIds = posts.getStakedUsers(postId);
+        for (uint256 i; i < userIds.length; i++) {
+            uint reward = posts.getStakedReward(userIds[i], postId);
+            blcks.mint(users.ownerOf(userIds[i]), reward);
+        }
+        posts.unstakeAll(postId, sender);
+    }
+
+    function faucet(uint256 numTokens, address sender) public {
+        // faucet for testing purposes
+        blcks.mint(sender, numTokens);
+        ntblcks.mint(sender, numTokens);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "ERC20.sol";
+import "ERC20Burnable.sol";
+import "AccessControl.sol";
+
+abstract contract baseBlock is ERC20, ERC20Burnable, AccessControl {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    address[] whitelistedAddresses;
+
+    event tokensMinted(address sender, uint256 numTokens);
+
+    function mint(address to, uint256 amount) public onlyRole(MINTER_ROLE) {
+        _mint(to, amount);
+        emit tokensMinted(to, amount);
+    }
+
+    function grantMinterRole(address minter) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(MINTER_ROLE, minter);
+    }
+
+    function whitelistAddress(address whitelist) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        whitelistedAddresses.push(whitelist);
+    }
+    
+    function checkAddressForWhitelist() public view returns(bool) {
+        for (uint256 i; i < whitelistedAddresses.length; i++) {
+            if (msg.sender == whitelistedAddresses[i]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function burnFrom(address account, uint256 amount) public virtual override {
+        if (checkAddressForWhitelist()) {
+            _burn(account, amount);
+        } else {
+            _spendAllowance(account, _msgSender(), amount);
+            _burn(account, amount);
+        }
+    }
+}
+
+contract Block is baseBlock {
+    constructor() ERC20("Block", "BLK") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        if (checkAddressForWhitelist()) {
+            address spender = _msgSender();
+            // _spendAllowance(from, spender, amount);
+            _transfer(from, to, amount);
+            return true;
+        } else {
+            address spender = _msgSender();
+            _spendAllowance(from, spender, amount);
+            _transfer(from, to, amount);
+            return true;
+        }
+    }
+}
+
+// Non-transferable version of regular Block token
+contract NTBlock is baseBlock {
+    constructor() ERC20("bBlock", "bBLK") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+    }
+    
+    // Override transfer function to always fail
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        require(false, "This is a non-transferable token");
+        // address owner = _msgSender();
+        // _transfer(owner, to, amount);
+        // return true;
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        require(false, "This is a non-transferable token");
+        // address spender = _msgSender();
+        // _spendAllowance(from, spender, amount);
+        // _transfer(from, to, amount);
+        // return true;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC20.sol";
+import "IERC20Metadata.sol";
+import "Context.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * The default value of {decimals} is 18. To select a different value for
+     * {decimals} you should overload it.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the value {ERC20} uses, unless this function is
+     * overridden;
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, _allowances[owner][spender] + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = _allowances[owner][spender];
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `sender` to `recipient`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+        }
+        _balances[to] += amount;
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        _balances[account] += amount;
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+        }
+        _totalSupply -= amount;
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Spend `amount` form the allowance of `owner` toward `spender`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/extensions/ERC20Burnable.sol)
+
+pragma solidity ^0.8.0;
+
+import "ERC20.sol";
+import "Context.sol";
+
+/**
+ * @dev Extension of {ERC20} that allows token holders to destroy both their own
+ * tokens and those that they have an allowance for, in a way that can be
+ * recognized off-chain (via event analysis).
+ */
+abstract contract ERC20Burnable is Context, ERC20 {
+    /**
+     * @dev Destroys `amount` tokens from the caller.
+     *
+     * See {ERC20-_burn}.
+     */
+    function burn(uint256 amount) public virtual {
+        _burn(_msgSender(), amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, deducting from the caller's
+     * allowance.
+     *
+     * See {ERC20-_burn} and {ERC20-allowance}.
+     *
+     * Requirements:
+     *
+     * - the caller must have allowance for ``accounts``'s tokens of at least
+     * `amount`.
+     */
+    function burnFrom(address account, uint256 amount) public virtual {
+        _spendAllowance(account, _msgSender(), amount);
+        _burn(account, amount);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "IAccessControl.sol";
+import "Context.sol";
+import "Strings.sol";
+import "ERC165.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it.
+ */
+abstract contract AccessControl is Context, IAccessControl, ERC165 {
+    struct RoleData {
+        mapping(address => bool) members;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with a standardized message including the required role.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     *
+     * _Available since v4.1._
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role, _msgSender());
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControl).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual override returns (bool) {
+        return _roles[role].members[account];
+    }
+
+    /**
+     * @dev Revert with a standard message if `account` is missing `role`.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert(
+                string(
+                    abi.encodePacked(
+                        "AccessControl: account ",
+                        Strings.toHexString(uint160(account), 20),
+                        " is missing role ",
+                        Strings.toHexString(uint256(role), 32)
+                    )
+                )
+            );
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual override returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     */
+    function renounceRole(bytes32 role, address account) public virtual override {
+        require(account == _msgSender(), "AccessControl: can only renounce roles for self");
+
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event. Note that unlike {grantRole}, this function doesn't perform any
+     * checks on the calling account.
+     *
+     * [WARNING]
+     * ====
+     * This function should only be called from the constructor when setting
+     * up the initial roles for the system.
+     *
+     * Using this function in any other way is effectively circumventing the admin
+     * system imposed by {AccessControl}.
+     * ====
+     *
+     * NOTE: This function is deprecated in favor of {_grantRole}.
+     */
+    function _setupRole(bytes32 role, address account) internal virtual {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * Internal function without access restriction.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual {
+        if (!hasRole(role, account)) {
+            _roles[role].members[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+        }
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * Internal function without access restriction.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual {
+        if (hasRole(role, account)) {
+            _roles[role].members[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControl {
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     *
+     * _Available since v3.1._
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     */
+    function renounceRole(bytes32 role, address account) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev String operations.
+ */
+library Strings {
+    bytes16 private constant _HEX_SYMBOLS = "0123456789abcdef";
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        // Inspired by OraclizeAPI's implementation - MIT licence
+        // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol
+
+        if (value == 0) {
+            return "0";
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0x00";
+        }
+        uint256 temp = value;
+        uint256 length = 0;
+        while (temp != 0) {
+            length++;
+            temp >>= 8;
+        }
+        return toHexString(value, length);
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = _HEX_SYMBOLS[value & 0xf];
+            value >>= 4;
+        }
+        require(value == 0, "Strings: hex length insufficient");
+        return string(buffer);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC165.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165 is IERC165 {
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IERC165).interfaceId;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "Input.sol";
+import "Comment.sol";
+
+contract Post is Input { 
+    Comment comments;
+
+    using Counters for Counters.Counter;
+
+    Counters.Counter private _tokenIdCounter;
+
+    struct Stake {
+        uint256 blockNumber;
+        uint256 amountStaked;
+        uint256 userScore;
+    }
+
+    uint public numBlocksForRewards = 100;
+    uint[] public postIds;
+    mapping(uint => mapping(uint => Stake)) postIdUserIdToStake;
+    uint numPostsStaked;
+    uint public numDigits = 10**(9-1);
+
+    event postMinted(InputStruct post, address sender); 
+    event stakedEvent(InputStruct post, uint userId, address sender, bool isStaked);
+
+    constructor(Comment _comments) ERC721("Post", "PST") {
+        comments = _comments;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _tokenIdCounter.increment();
+    }    
+
+    function safeMint(address to) internal returns(uint256) {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        return tokenId;
+    }
+
+    function mintPost(
+            uint userId, 
+            string memory username,
+            string memory category, 
+            string memory title, 
+            string memory text, 
+            string memory link,
+            address sender,
+            uint stakingTip,
+            bool isNSFW
+        ) public onlyRole(MINTER_ROLE) 
+    {
+        uint postId = safeMint(sender);
+        uint[] memory emptyList;
+        MetaData memory metaData = MetaData(username, category, title, text, link);
+        InputStruct memory input = InputStruct(
+            metaData, postId, userId, block.number, emptyList, emptyList, isNSFW, 
+            0, 0, 0, 0, false
+        );
+        idToInput[postId] = input;
+        postIds.push(postId);
+        rewardPost(postId, stakingTip);
+        emit inputEvent(input, input.metaData, sender);
+    }
+
+    function stakeOnPost(
+            uint userId, uint postId, uint numTokens, uint userScore, address sender
+        ) public onlyRole(MINTER_ROLE) 
+    {
+        Stake memory stake = postIdUserIdToStake[postId][userId];
+        require(stake.blockNumber == 0, "You have already staked this post");
+        InputStruct memory input = idToInput[postId];
+        require(input.blockMint + numBlocksForRewards > block.number, "Post is no longer stakable");
+
+        postIdUserIdToStake[postId][userId] = Stake(block.number, numTokens, userScore);
+        idToInput[postId].usersStaked.push(userId);
+        idToInput[postId].totalStaked += numTokens;
+        emit inputEvent(idToInput[postId], idToInput[postId].metaData, sender);
+    }
+
+    function getStakedUsers(uint postId) public view returns(uint[] memory) {
+        return idToInput[postId].usersStaked;
+    }
+
+    function getStakedReward(uint userId, uint postId) public view returns(uint) {
+        // ToDo: This doesn't account for 100% of the rewards. Need to keep track of first staked block
+        Stake memory stake = postIdUserIdToStake[postId][userId];
+        require(stake.blockNumber != 0, "You are not staking this post");
+        InputStruct memory post = idToInput[postId];
+        uint timeMultiplier = (numBlocksForRewards - (stake.blockNumber - post.blockMint))**2 * numDigits / numBlocksForRewards**2;
+        uint stakedMultiplier = stake.amountStaked * numDigits / post.totalStaked;
+        return timeMultiplier * stakedMultiplier * post.totalStaked / numDigits**2;
+    }
+
+    function unstakeAll(uint postId, address sender) public onlyRole(MINTER_ROLE) {    
+        InputStruct memory input = idToInput[postId];
+        require(input.blockMint + numBlocksForRewards < block.number, "Not unstakable yet");
+        require(!idToInput[postId].stakesClaimed, "Stake claimed already");
+        idToInput[postId].stakesClaimed = true;
+        idToInput[postId].totalStaked = 0;
+        emit inputEvent(idToInput[postId], idToInput[postId].metaData, sender);
+        idToInput[postId].usersStaked;
+    }
+
+    function rewardPost(uint postId, uint reward) public {
+        idToInput[postId].totalReward += reward;
+    }
+
+    //Functions to get all comments and their children from a post
+    function getChildData(uint256 commentId, uint256 n) public view returns (string memory) {
+        // Get ids of all child comments and their children
+        uint256[] memory postComments = comments.getInputComments(commentId);
+        bytes memory result = abi.encodePacked(', "comments": [');
+        for (uint256 i; i < postComments.length; i++) {
+            string memory comma;
+            if (i > 0) {comma = ',';}
+            result = abi.encodePacked(
+                result, comma,
+                '{"id": ',
+                Strings.toString(postComments[i]),
+                getChildData(postComments[i], n + 1),
+                "}"
+            );
+        }
+        result = abi.encodePacked(result, "]");
+        return string(result);
+    }
+
+    function getPostData(uint256 postId) public view returns (string memory) {
+        // Get ids of all comments and their children on a post
+        bytes memory result = abi.encodePacked(
+            '{"post": {"id": ',
+            Strings.toString(postId),
+            ', "comments": ['
+        );
+        uint256[] memory postComments = getInputComments(postId);
+        for (uint256 i; i < postComments.length; i++) {
+            string memory comma;
+            if (i > 0) {comma = ',';}
+            result = abi.encodePacked(
+                result, comma, '{"id": ',
+                Strings.toString(postComments[i]),
+                getChildData(postComments[i], 1),
+                "}"
+            );
+        }
+        result = abi.encodePacked(string(result), "]}}");
+        return string(result);
+    }
+
+
+    // The following are functions used on comments on a post
+    function voteOnComment(uint commentId, address sender, bool isUp) public onlyRole(MINTER_ROLE) {
+        comments.voteOnInput(commentId, sender, false);
+    }
+
+    function makeComment(
+            uint userId, 
+            string memory username,
+            string memory text, 
+            uint parentId,
+            bool onPost,
+            address sender,
+            bool isNSFW
+        ) public onlyRole(MINTER_ROLE) 
+    {
+        uint commentId = comments.mintComment(userId, username, text, sender, isNSFW, sender);
+        if (onPost) {
+            addComment(parentId, commentId, sender);
+        } else {
+            comments.addComment(parentId, commentId, sender);
+        }
+    }
+
+    function burnComment(uint commentId, uint parentId, bool onPost, address sender) public {
+        comments.burn(commentId);
+        if (onPost) {
+            removeIdFromCommentList(commentId, parentId, sender);
+        } else {
+            comments.removeIdFromCommentList(commentId, parentId, sender);
+        }
+    }
+
+    function setAsNSFW(uint inputId, bool onPost, address sender) public onlyRole(MINTER_ROLE) {
+        if (onPost) {
+            idToInput[inputId].isNSFW = true;
+            emit inputEvent(idToInput[inputId], idToInput[inputId].metaData, sender);
+        } else {
+            comments.setCommentAsNSFW(inputId, sender);
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "ERC721Sendable.sol";
+import "ERC721.sol";
+import "ERC721Burnable.sol";
+import "Counters.sol";
+import "AccessControl.sol";
+
+abstract contract Input is ERC721, ERC721Burnable, ERC721Sendable, AccessControl {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    struct MetaData {
+        string username;
+        string category;
+        string title;
+        string text;
+        string link;
+    }
+    
+    struct InputStruct {
+        MetaData metaData;
+        uint inputId;
+        uint userId;
+        uint blockMint;
+        uint[] commentsHead;
+        uint[] usersStaked;
+        bool isNSFW;
+        uint upvotes;
+        uint downvotes;
+        uint totalStaked;
+        uint totalReward;
+        bool stakesClaimed;
+    }  
+
+    mapping(uint => InputStruct) public idToInput;
+    mapping(address => mapping(uint => uint)) userInputIdVoteCount;
+    
+    event inputEvent(InputStruct input, MetaData metaData, address sender);
+    
+    // Overrides interface
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC721, AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function grantMinterRole(address minter) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(MINTER_ROLE, minter);
+    }
+
+    function voteOnInput(uint inputId, address sender, bool isUp) public onlyRole(MINTER_ROLE) {
+        InputStruct storage input = idToInput[inputId];
+        // require(inputId !=0 && inputId <= _tokenIdCounter.current(), "Bad inputId");
+        require(userInputIdVoteCount[sender][inputId] == 0, "You have already voted on this input");
+        if (isUp) {
+            idToInput[inputId].upvotes++;
+        } else {
+            idToInput[inputId].downvotes++;
+        }
+        userInputIdVoteCount[sender][inputId]++;
+        emit inputEvent(idToInput[inputId], idToInput[inputId].metaData, sender);
+    }
+
+    function getInput(uint inputId) public view returns(InputStruct memory) {
+        return idToInput[inputId];
+    }
+
+    function getInputComments(uint inputId) public view returns(uint[] memory) {
+        return idToInput[inputId].commentsHead;
+    }
+
+    function addComment(uint parentId, uint commentId, address sender) public onlyRole(MINTER_ROLE) {
+        idToInput[parentId].commentsHead.push(commentId);
+        emit inputEvent(idToInput[parentId], idToInput[parentId].metaData, sender);
+    }
+
+    function labelInputAsNSFW(uint inputId, address sender) public onlyRole(MINTER_ROLE) {
+        idToInput[inputId].isNSFW = true;
+        emit inputEvent(idToInput[inputId], idToInput[inputId].metaData, sender);
+    }
+
+    function removeIdFromCommentList(uint commentId, uint parentId, address sender) public {
+        uint[] memory comments = idToInput[parentId].commentsHead;
+        for (uint256 i; i < comments.length; i++) {
+            if (commentId == comments[i]) {
+                idToInput[parentId].commentsHead[i] = comments[comments.length - 1];
+                idToInput[parentId].commentsHead.pop();
+            }
+        }
+        emit inputEvent(idToInput[parentId], idToInput[parentId].metaData, sender);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "ERC721.sol";
+
+
+abstract contract ERC721Sendable is Context, ERC721 {
+    // check that address is owner
+    modifier onlySender(uint userId, address sender) {        
+        require(
+            ownerOf(userId) == sender, 
+            "You do not own this profile"
+        );
+        _;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC721/ERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC721.sol";
+import "IERC721Receiver.sol";
+import "IERC721Metadata.sol";
+import "Address.sol";
+import "Context.sol";
+import "Strings.sol";
+import "ERC165.sol";
+
+/**
+ * @dev Implementation of https://eips.ethereum.org/EIPS/eip-721[ERC721] Non-Fungible Token Standard, including
+ * the Metadata extension, but not including the Enumerable extension, which is available separately as
+ * {ERC721Enumerable}.
+ */
+contract ERC721 is Context, ERC165, IERC721, IERC721Metadata {
+    using Address for address;
+    using Strings for uint256;
+
+    // Token name
+    string private _name;
+
+    // Token symbol
+    string private _symbol;
+
+    // Mapping from token ID to owner address
+    mapping(uint256 => address) private _owners;
+
+    // Mapping owner address to token count
+    mapping(address => uint256) private _balances;
+
+    // Mapping from token ID to approved address
+    mapping(uint256 => address) private _tokenApprovals;
+
+    // Mapping from owner to operator approvals
+    mapping(address => mapping(address => bool)) private _operatorApprovals;
+
+    /**
+     * @dev Initializes the contract by setting a `name` and a `symbol` to the token collection.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165, IERC165) returns (bool) {
+        return
+            interfaceId == type(IERC721).interfaceId ||
+            interfaceId == type(IERC721Metadata).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IERC721-balanceOf}.
+     */
+    function balanceOf(address owner) public view virtual override returns (uint256) {
+        require(owner != address(0), "ERC721: balance query for the zero address");
+        return _balances[owner];
+    }
+
+    /**
+     * @dev See {IERC721-ownerOf}.
+     */
+    function ownerOf(uint256 tokenId) public view virtual override returns (address) {
+        address owner = _owners[tokenId];
+        require(owner != address(0), "ERC721: owner query for nonexistent token");
+        return owner;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-name}.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-symbol}.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-tokenURI}.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+        require(_exists(tokenId), "ERC721Metadata: URI query for nonexistent token");
+
+        string memory baseURI = _baseURI();
+        return bytes(baseURI).length > 0 ? string(abi.encodePacked(baseURI, tokenId.toString())) : "";
+    }
+
+    /**
+     * @dev Base URI for computing {tokenURI}. If set, the resulting URI for each
+     * token will be the concatenation of the `baseURI` and the `tokenId`. Empty
+     * by default, can be overriden in child contracts.
+     */
+    function _baseURI() internal view virtual returns (string memory) {
+        return "";
+    }
+
+    /**
+     * @dev See {IERC721-approve}.
+     */
+    function approve(address to, uint256 tokenId) public virtual override {
+        address owner = ERC721.ownerOf(tokenId);
+        require(to != owner, "ERC721: approval to current owner");
+
+        require(
+            _msgSender() == owner || isApprovedForAll(owner, _msgSender()),
+            "ERC721: approve caller is not owner nor approved for all"
+        );
+
+        _approve(to, tokenId);
+    }
+
+    /**
+     * @dev See {IERC721-getApproved}.
+     */
+    function getApproved(uint256 tokenId) public view virtual override returns (address) {
+        require(_exists(tokenId), "ERC721: approved query for nonexistent token");
+
+        return _tokenApprovals[tokenId];
+    }
+
+    /**
+     * @dev See {IERC721-setApprovalForAll}.
+     */
+    function setApprovalForAll(address operator, bool approved) public virtual override {
+        _setApprovalForAll(_msgSender(), operator, approved);
+    }
+
+    /**
+     * @dev See {IERC721-isApprovedForAll}.
+     */
+    function isApprovedForAll(address owner, address operator) public view virtual override returns (bool) {
+        return _operatorApprovals[owner][operator];
+    }
+
+    /**
+     * @dev See {IERC721-transferFrom}.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public virtual override {
+        //solhint-disable-next-line max-line-length
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721: transfer caller is not owner nor approved");
+
+        _transfer(from, to, tokenId);
+    }
+
+    /**
+     * @dev See {IERC721-safeTransferFrom}.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public virtual override {
+        safeTransferFrom(from, to, tokenId, "");
+    }
+
+    /**
+     * @dev See {IERC721-safeTransferFrom}.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) public virtual override {
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721: transfer caller is not owner nor approved");
+        _safeTransfer(from, to, tokenId, _data);
+    }
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * `_data` is additional data, it has no specified format and it is sent in call to `to`.
+     *
+     * This internal function is equivalent to {safeTransferFrom}, and can be used to e.g.
+     * implement alternative mechanisms to perform token transfer, such as signature-based.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _safeTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) internal virtual {
+        _transfer(from, to, tokenId);
+        require(_checkOnERC721Received(from, to, tokenId, _data), "ERC721: transfer to non ERC721Receiver implementer");
+    }
+
+    /**
+     * @dev Returns whether `tokenId` exists.
+     *
+     * Tokens can be managed by their owner or approved accounts via {approve} or {setApprovalForAll}.
+     *
+     * Tokens start existing when they are minted (`_mint`),
+     * and stop existing when they are burned (`_burn`).
+     */
+    function _exists(uint256 tokenId) internal view virtual returns (bool) {
+        return _owners[tokenId] != address(0);
+    }
+
+    /**
+     * @dev Returns whether `spender` is allowed to manage `tokenId`.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function _isApprovedOrOwner(address spender, uint256 tokenId) internal view virtual returns (bool) {
+        require(_exists(tokenId), "ERC721: operator query for nonexistent token");
+        address owner = ERC721.ownerOf(tokenId);
+        return (spender == owner || getApproved(tokenId) == spender || isApprovedForAll(owner, spender));
+    }
+
+    /**
+     * @dev Safely mints `tokenId` and transfers it to `to`.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must not exist.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _safeMint(address to, uint256 tokenId) internal virtual {
+        _safeMint(to, tokenId, "");
+    }
+
+    /**
+     * @dev Same as {xref-ERC721-_safeMint-address-uint256-}[`_safeMint`], with an additional `data` parameter which is
+     * forwarded in {IERC721Receiver-onERC721Received} to contract recipients.
+     */
+    function _safeMint(
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) internal virtual {
+        _mint(to, tokenId);
+        require(
+            _checkOnERC721Received(address(0), to, tokenId, _data),
+            "ERC721: transfer to non ERC721Receiver implementer"
+        );
+    }
+
+    /**
+     * @dev Mints `tokenId` and transfers it to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {_safeMint} whenever possible
+     *
+     * Requirements:
+     *
+     * - `tokenId` must not exist.
+     * - `to` cannot be the zero address.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _mint(address to, uint256 tokenId) internal virtual {
+        require(to != address(0), "ERC721: mint to the zero address");
+        require(!_exists(tokenId), "ERC721: token already minted");
+
+        _beforeTokenTransfer(address(0), to, tokenId);
+
+        _balances[to] += 1;
+        _owners[tokenId] = to;
+
+        emit Transfer(address(0), to, tokenId);
+
+        _afterTokenTransfer(address(0), to, tokenId);
+    }
+
+    /**
+     * @dev Destroys `tokenId`.
+     * The approval is cleared when the token is burned.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _burn(uint256 tokenId) internal virtual {
+        address owner = ERC721.ownerOf(tokenId);
+
+        _beforeTokenTransfer(owner, address(0), tokenId);
+
+        // Clear approvals
+        _approve(address(0), tokenId);
+
+        _balances[owner] -= 1;
+        delete _owners[tokenId];
+
+        emit Transfer(owner, address(0), tokenId);
+
+        _afterTokenTransfer(owner, address(0), tokenId);
+    }
+
+    /**
+     * @dev Transfers `tokenId` from `from` to `to`.
+     *  As opposed to {transferFrom}, this imposes no restrictions on msg.sender.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {
+        require(ERC721.ownerOf(tokenId) == from, "ERC721: transfer from incorrect owner");
+        require(to != address(0), "ERC721: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, tokenId);
+
+        // Clear approvals from the previous owner
+        _approve(address(0), tokenId);
+
+        _balances[from] -= 1;
+        _balances[to] += 1;
+        _owners[tokenId] = to;
+
+        emit Transfer(from, to, tokenId);
+
+        _afterTokenTransfer(from, to, tokenId);
+    }
+
+    /**
+     * @dev Approve `to` to operate on `tokenId`
+     *
+     * Emits a {Approval} event.
+     */
+    function _approve(address to, uint256 tokenId) internal virtual {
+        _tokenApprovals[tokenId] = to;
+        emit Approval(ERC721.ownerOf(tokenId), to, tokenId);
+    }
+
+    /**
+     * @dev Approve `operator` to operate on all of `owner` tokens
+     *
+     * Emits a {ApprovalForAll} event.
+     */
+    function _setApprovalForAll(
+        address owner,
+        address operator,
+        bool approved
+    ) internal virtual {
+        require(owner != operator, "ERC721: approve to caller");
+        _operatorApprovals[owner][operator] = approved;
+        emit ApprovalForAll(owner, operator, approved);
+    }
+
+    /**
+     * @dev Internal function to invoke {IERC721Receiver-onERC721Received} on a target address.
+     * The call is not executed if the target address is not a contract.
+     *
+     * @param from address representing the previous owner of the given token ID
+     * @param to target address that will receive the tokens
+     * @param tokenId uint256 ID of the token to be transferred
+     * @param _data bytes optional data to send along with the call
+     * @return bool whether the call correctly returned the expected magic value
+     */
+    function _checkOnERC721Received(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory _data
+    ) private returns (bool) {
+        if (to.isContract()) {
+            try IERC721Receiver(to).onERC721Received(_msgSender(), from, tokenId, _data) returns (bytes4 retval) {
+                return retval == IERC721Receiver.onERC721Received.selector;
+            } catch (bytes memory reason) {
+                if (reason.length == 0) {
+                    revert("ERC721: transfer to non ERC721Receiver implementer");
+                } else {
+                    assembly {
+                        revert(add(32, reason), mload(reason))
+                    }
+                }
+            }
+        } else {
+            return true;
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any token transfer. This includes minting
+     * and burning.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, ``from``'s `tokenId` will be
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` will be minted for `to`.
+     * - When `to` is zero, ``from``'s `tokenId` will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC165.sol";
+
+/**
+ * @dev Required interface of an ERC721 compliant contract.
+ */
+interface IERC721 is IERC165 {
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in ``owner``'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be have been allowed to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Transfers `tokenId` token from `from` to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {safeTransferFrom} whenever possible.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the caller.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool _approved) external;
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata data
+    ) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/IERC721Receiver.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @title ERC721 token receiver interface
+ * @dev Interface for any contract that wants to support safeTransfers
+ * from ERC721 asset contracts.
+ */
+interface IERC721Receiver {
+    /**
+     * @dev Whenever an {IERC721} `tokenId` token is transferred to this contract via {IERC721-safeTransferFrom}
+     * by `operator` from `from`, this function is called.
+     *
+     * It must return its Solidity selector to confirm the token transfer.
+     * If any other value is returned or the interface is not implemented by the recipient, the transfer will be reverted.
+     *
+     * The selector can be obtained in Solidity with `IERC721.onERC721Received.selector`.
+     */
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/extensions/IERC721Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "IERC721.sol";
+
+/**
+ * @title ERC-721 Non-Fungible Token Standard, optional metadata extension
+ * @dev See https://eips.ethereum.org/EIPS/eip-721
+ */
+interface IERC721Metadata is IERC721 {
+    /**
+     * @dev Returns the token collection name.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the token collection symbol.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.
+     */
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCall(target, data, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        require(isContract(target), "Address: call to non-contract");
+
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        require(isContract(target), "Address: static call to non-contract");
+
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(isContract(target), "Address: delegate call to non-contract");
+
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            // Look for revert reason and bubble it up if present
+            if (returndata.length > 0) {
+                // The easiest way to bubble the revert reason is using memory via assembly
+
+                assembly {
+                    let returndata_size := mload(returndata)
+                    revert(add(32, returndata), returndata_size)
+                }
+            } else {
+                revert(errorMessage);
+            }
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/extensions/ERC721Burnable.sol)
+
+pragma solidity ^0.8.0;
+
+import "ERC721.sol";
+import "Context.sol";
+
+/**
+ * @title ERC721 Burnable Token
+ * @dev ERC721 Token that can be irreversibly burned (destroyed).
+ */
+abstract contract ERC721Burnable is Context, ERC721 {
+    /**
+     * @dev Burns `tokenId`. See {ERC721-_burn}.
+     *
+     * Requirements:
+     *
+     * - The caller must own `tokenId` or be an approved operator.
+     */
+    function burn(uint256 tokenId) public virtual {
+        //solhint-disable-next-line max-line-length
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721Burnable: caller is not owner nor approved");
+        _burn(tokenId);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Counters.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @title Counters
+ * @author Matt Condon (@shrugs)
+ * @dev Provides counters that can only be incremented, decremented or reset. This can be used e.g. to track the number
+ * of elements in a mapping, issuing ERC721 ids, or counting request ids.
+ *
+ * Include with `using Counters for Counters.Counter;`
+ */
+library Counters {
+    struct Counter {
+        // This variable should never be directly accessed by users of the library: interactions must be restricted to
+        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add
+        // this feature: see https://github.com/ethereum/solidity/issues/4637
+        uint256 _value; // default: 0
+    }
+
+    function current(Counter storage counter) internal view returns (uint256) {
+        return counter._value;
+    }
+
+    function increment(Counter storage counter) internal {
+        unchecked {
+            counter._value += 1;
+        }
+    }
+
+    function decrement(Counter storage counter) internal {
+        uint256 value = counter._value;
+        require(value > 0, "Counter: decrement overflow");
+        unchecked {
+            counter._value = value - 1;
+        }
+    }
+
+    function reset(Counter storage counter) internal {
+        counter._value = 0;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "Input.sol";
+
+contract Comment is Input {
+
+    using Counters for Counters.Counter;
+
+    Counters.Counter private _tokenIdCounter;
+
+    event commentMinted(InputStruct comment, address sender); 
+
+    constructor() ERC721("Comment", "CMT") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _tokenIdCounter.increment();
+    }  
+
+    function safeMint(address to) internal returns(uint) {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        return tokenId;
+    }
+
+    function mintComment(
+            uint userId, 
+            string memory username,
+            string memory text,
+            address to,
+            bool isNSFW, address sender
+        ) public onlyRole(MINTER_ROLE) returns(uint) {
+        uint tokenId = safeMint(to);
+        uint[] memory emptyList;
+        MetaData memory metaData = MetaData(username, '', '', text, '');
+        InputStruct memory comment = InputStruct(
+            metaData, tokenId, userId, block.number, emptyList, emptyList, isNSFW, 
+            0, 0, 0, 0, false
+        );
+        emit inputEvent(comment, metaData, sender);
+        return tokenId;
+    }
+
+    function setCommentAsNSFW(uint inputId, address sender) public onlyRole(MINTER_ROLE) {
+        idToInput[inputId].isNSFW = true;
+        emit inputEvent(idToInput[inputId], idToInput[inputId].metaData, sender);
+    }
+
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "ERC721Sendable.sol";
+import { ByteHasher } from "ByteHasher.sol";
+import { ISemaphore } from "ISemaphore.sol";
+import "ERC721.sol";
+import "ERC721Burnable.sol";
+import "Counters.sol";
+import "AccessControl.sol";
+
+contract User is ERC721, ERC721Burnable, ERC721Sendable, AccessControl {
+    using ByteHasher for bytes;
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    using Counters for Counters.Counter;
+
+    Counters.Counter private _tokenIdCounter;
+
+    /// @dev The Semaphore instance that will be used for managing groups and verifying proofs
+    ISemaphore internal immutable semaphore;
+    /// @dev The Semaphore group ID whose participants can claim this airdrop
+    uint256 internal immutable groupId;
+    mapping(uint256 => bool) internal nullifierHashes;
+    event ProofVerified(uint groupId, bytes32 signal);
+    /// @notice Thrown when attempting to reuse a nullifier
+    error InvalidNullifier();
+
+    struct UserStruct {
+        uint256 userId;
+        uint256 blockMinted;
+        string username;
+        uint[] followers;
+        uint[] following;
+        uint256 totalUpvotes;
+        uint256 totalDownvotes;
+        uint256 dailyQuest;
+        uint256 experience;
+        uint256 level;
+        uint256 expToNextLvl;
+        uint256 captureRate;
+        // Centralities combine to determine a multiplier for the user
+        // Degree is how many followers a user has
+        uint256 degreeCentrality;
+        // farness is how far away each user its connected to is
+        uint256 farnessCentrality;
+        // betweenness is how much a user connects their following to their followers
+        uint256 betweennessCentrality;
+    }
+
+    // Users receive exp rewards for completing certain tasks
+    struct Rewards {
+        uint worldID;
+        uint email;
+        uint twoStepVerification;
+        uint postVote;
+        uint commentVote;
+        uint daoVote;
+    }
+
+    struct ShortestPath {
+        uint size;
+        uint[] prev;
+    }
+
+    event userEvent(UserStruct user, address sender);
+
+    // events used for testing    
+    event centralitiesUpdated(uint userIdStarting, uint userIdCurrent, uint userIdFollower, ShortestPath SP);
+    event fired(uint iter);
+    event betweennessUpdate(uint iter, uint userId, uint newBetweenness);
+    event printStartCurrent(uint startingUserId, uint currentUserId, uint followerUserId, uint depth, uint p);
+
+    uint public numNodes;
+    uint public numDigits = 10**(9-1);
+    mapping(uint => UserStruct) public userIdToUser;
+    mapping(address => uint) public numUsersMinted;
+    uint public maxMintsPerWallet = 1;
+    Rewards public rewards;
+
+    // mapping to be used when graphing
+    mapping(uint => mapping(uint => ShortestPath)) public shortestPath;
+    mapping(uint => mapping(uint => bool)) public prevFollowingUsers;
+    mapping(uint => mapping(uint => mapping(uint => mapping(uint => uint)))) public prevFollowerUsersDepth;
+    uint public prevFollowingIter;
+    uint public prevFollowerIter;
+
+    // constructor(ISemaphore _semaphore) ERC721("User", "USR") {
+    constructor(ISemaphore _semaphore) ERC721("User", "USR") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _tokenIdCounter.increment();
+        
+        semaphore = _semaphore;
+        groupId = 0;
+        
+        rewards = Rewards(1000, 100, 100, 1, 1, 5);
+    }
+
+    // Overrides interface
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC721, AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function grantMinterRole(address minter) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(MINTER_ROLE, minter);
+    }
+
+    function safeMint(address to) internal returns (uint256) {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        return tokenId;
+    }
+
+    function mintUser(string memory username, address sender) public onlyRole(MINTER_ROLE) {
+        // require(
+        //     numUsersMinted[to] < maxMintsPerWallet, 
+        //     "You have minted the max amount of profiles!"
+        // );
+        uint256 tokenId = safeMint(sender);
+        uint[] memory emptyFollow;
+        UserStruct memory user = UserStruct(
+            tokenId, block.number, username, emptyFollow, emptyFollow, 
+            0, 0, 0, 0, 83, 100, 0, 0, 0, 0
+        );
+        userIdToUser[tokenId] = user;
+        numUsersMinted[sender]++;
+        emit userEvent(user, sender);
+    }
+
+    function getUser(uint userId) public view returns(UserStruct memory) {
+        UserStruct memory user = userIdToUser[userId];
+        return user;
+    }
+
+    function setMaxMintsPerWallet(uint newMax) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxMintsPerWallet = newMax;
+    }
+
+    function calculateCentralityValues(
+            uint startingUserId, uint currentUserId, uint followerUserId, uint depth
+        ) public returns(bool) {
+
+        // if (startingUserId == 5 && currentUserId == 2) {
+        //     uint p = prevFollowerUsersDepth[prevFollowerIter][startingUserId][currentUserId][followerUserId];
+        //     emit printStartCurrent(startingUserId, currentUserId, followerUserId, depth, p);
+        // }
+
+        // If we have already encountered this user then move on
+        uint p = prevFollowerUsersDepth[prevFollowerIter][startingUserId][currentUserId][followerUserId];
+        if (p != 0 && depth >= p) {
+            return true;
+        }
+        if (startingUserId == followerUserId || startingUserId == currentUserId) {
+            prevFollowerUsersDepth[prevFollowerIter][startingUserId][currentUserId][followerUserId] = depth;
+            return true;
+        }
+
+        prevFollowerUsersDepth[prevFollowerIter][startingUserId][currentUserId][followerUserId] = depth;
+
+        ShortestPath memory SP = shortestPath[startingUserId][followerUserId];
+        // If shortest path has been found before and its shorter then move on
+        if (SP.size != 0 && SP.size < depth) {
+            return false;
+        }
+
+        if (SP.size == 0) {
+            // we found our first shortest path
+            userIdToUser[startingUserId].farnessCentrality += depth;
+            shortestPath[startingUserId][followerUserId].size = depth;
+            shortestPath[startingUserId][followerUserId].prev.push(currentUserId);
+            if (depth > 1) {
+                userIdToUser[currentUserId].betweennessCentrality += (numDigits / (SP.prev.length + 1));
+                // emit betweennessUpdate(0, currentUserId, userIdToUser[currentUserId].betweennessCentrality);
+            }
+        } else if (SP.size == depth) {
+            // we have a tie for shortest path so betweenness gets shared
+            if (depth > 1) {
+                bool stop = false;
+                for (uint256 i; i < SP.prev.length; i++) {
+                    if (SP.prev[i] == currentUserId) {
+                        stop = true;
+                    }
+                }
+                
+                if (!stop) {
+                    uint oldBetweenness = (numDigits / SP.prev.length);
+                    uint newBetweenness = (numDigits / (SP.prev.length + 1));
+                    userIdToUser[currentUserId].betweennessCentrality += newBetweenness;
+                    // emit betweennessUpdate(1, currentUserId, userIdToUser[currentUserId].betweennessCentrality);
+                    for (uint256 i; i < SP.prev.length; i++) {
+                        userIdToUser[SP.prev[i]].betweennessCentrality -= oldBetweenness;
+                        userIdToUser[SP.prev[i]].betweennessCentrality += newBetweenness;
+                        // emit betweennessUpdate(1, SP.prev[i], userIdToUser[SP.prev[i]].betweennessCentrality);
+                    }
+                    shortestPath[startingUserId][followerUserId].size = depth;
+                    shortestPath[startingUserId][followerUserId].prev.push(currentUserId);
+                }
+            }
+        } else if (SP.size > depth) {
+            // We've found a new shortest path
+            userIdToUser[startingUserId].farnessCentrality -= SP.size * numDigits;
+            userIdToUser[startingUserId].farnessCentrality += depth * numDigits;
+
+            uint oldBetweenness = (numDigits / SP.prev.length);
+            userIdToUser[currentUserId].betweennessCentrality += numDigits;
+            // emit betweennessUpdate(2, currentUserId, userIdToUser[currentUserId].betweennessCentrality);
+            for (uint256 i; i < SP.prev.length; i++) {
+                userIdToUser[SP.prev[i]].betweennessCentrality -= oldBetweenness;
+                // emit betweennessUpdate(2, SP.prev[i], userIdToUser[SP.prev[i]].betweennessCentrality);
+            }
+            delete shortestPath[startingUserId][followerUserId].prev;
+            shortestPath[startingUserId][followerUserId].size = depth;
+            shortestPath[startingUserId][followerUserId].prev.push(currentUserId);
+        } 
+        // emit centralitiesUpdated(startingUserId, currentUserId, followerUserId, shortestPath[startingUserId][followerUserId]);
+        return false;
+    }
+
+    function updateCentrality(uint startingUserId, uint currentUserId, uint depth) public { 
+        UserStruct memory user = userIdToUser[currentUserId];
+        // if (startingUserId == 5 && currentUserId == 2) {
+        //     printStartCurrent(user);
+        // }
+        if (depth == 1) {
+            calculateCentralityValues(startingUserId, currentUserId, currentUserId, 1);
+        }
+        if (user.followers.length > 0) {
+            for (uint256 i; i < user.followers.length; i++) {
+                // if (startingUserId == 5 && currentUserId == 2) {
+                //     printStartFollower(user, userIdToUser[currentUserId]);
+                // }
+                bool done = calculateCentralityValues(startingUserId, currentUserId, user.followers[i], depth + 1);
+
+                if (!done) {
+                    // Run recursions for this user and starting user
+                    updateCentrality(currentUserId, user.followers[i], 1);
+                    updateCentrality(startingUserId, user.followers[i], depth + 1);
+                }
+            }
+        } else if (depth == 1) {
+            // calculateCentralityValues(startingUserId, currentUserId, currentUserId, depth);
+        }
+    }
+
+    function updateFromFollowHead(uint userId) public {
+        // Gets you to top of following tree
+        UserStruct memory user = userIdToUser[userId];
+
+        prevFollowingUsers[prevFollowingIter][userId] = true;
+        
+        if (user.following.length > 0) {
+            for (uint256 i; i < user.following.length; i++) {
+                // once at top start going down tree starting at following
+                if (!prevFollowingUsers[prevFollowingIter][user.following[i]]) {
+                    updateFromFollowHead(user.following[i]);
+                } else {
+                    updateCentrality(user.following[i], userId, 1);
+                }
+            }
+        } else {
+            for (uint256 i; i < user.followers.length; i++) {
+                updateCentrality(userId, user.followers[i], 1);
+            }
+        }
+    }
+
+    function follow( 
+            uint userIdProtagonist, 
+            uint userIdAntagonist,
+            address sender
+        ) public onlyRole(MINTER_ROLE) {
+        UserStruct memory user = userIdToUser[userIdProtagonist];
+        uint followingLength = userIdToUser[userIdProtagonist].following.length;
+        for (uint256 i; i < followingLength; i++) {
+            require(userIdAntagonist != user.following[i], "You already follow this user");
+        }
+        // If this is a users first follow it becomes a node in the graph
+        if (followingLength == 0) {
+            numNodes++;
+        }
+        userIdToUser[userIdProtagonist].following.push(userIdAntagonist);
+        userIdToUser[userIdAntagonist].followers.push(userIdProtagonist);
+
+        // update followers (and thier followers etc) centralities
+        userIdToUser[userIdAntagonist].degreeCentrality += numDigits;
+
+        // go up following branches until you reach head
+        // updateFromFollowHead(userIdAntagonist);
+        prevFollowerIter++;
+        prevFollowingIter++;
+        emit userEvent(userIdToUser[userIdProtagonist], sender);
+    }
+
+    function unFollow(
+            uint userIdProtagonist,
+            uint userIdAntagonist, 
+            address sender
+        ) public onlyRole(MINTER_ROLE) {
+        UserStruct memory user = userIdToUser[userIdProtagonist];
+        uint256 l = user.following.length;
+        bool unfollowed;
+        for (uint256 i; i < l; i++) {
+            if (user.following[i] == userIdAntagonist) {
+                userIdToUser[userIdProtagonist].following[i] = userIdToUser[
+                    userIdProtagonist
+                ].following[l - 1];
+                userIdToUser[userIdProtagonist].following.pop();
+                unfollowed = true;
+                break;
+            }
+        }
+        require(unfollowed, "You have not followed this user");
+        uint followersAfter = userIdToUser[userIdProtagonist].following.length;
+        emit userEvent(userIdToUser[userIdProtagonist], sender);
+    }
+
+    function getsCentralitiesNormalized(uint userId) public view returns(uint[3] memory) {
+        uint[3] memory result = [uint(0), uint(0), uint(0)];
+        if (numNodes == 0) {
+            return result;
+        }
+        // These are numbers between 0 and 1 so multiply by numDigits
+        UserStruct memory user = userIdToUser[userId];
+        uint degree = user.degreeCentrality / (numNodes * numDigits);
+        uint closeness = 0;
+        if (user.farnessCentrality != 0) {
+            closeness = ((numNodes - 1) * numDigits) / (user.farnessCentrality);
+        }
+        uint betweenness = 0;
+        if (numNodes > 2) {
+            betweenness = user.betweennessCentrality / ((numNodes-1) * (numNodes - 2) * numDigits) ;
+        }
+        result = [degree, closeness, betweenness];
+        return result;
+    }
+
+    function getCentralityScore(uint userId) public view returns(uint) {
+        // take weighted average of centralities with weights higher for smaller numbers
+        // this is because we want all centralities to be similar to each other
+        uint256[3] memory centralities = getsCentralitiesNormalized(userId);
+        uint256[3] memory weights = [uint(1), uint(1), uint(1)];
+        if (centralities[0] < centralities[1]) {weights[0]++;} else {weights[1]++;}
+        if (centralities[0] < centralities[2]) {weights[0]++;} else {weights[2]++;}
+        if (centralities[1] < centralities[2]) {weights[1]++;} else {weights[2]++;}
+
+        uint result;
+        for (uint256 i; i < 3; i++) {
+            result += centralities[i] * weights[i];
+        }
+
+        return result / 6;
+    }
+
+    function addExp(uint exp, uint userId, address sender) public { //onlyRole(MINTER_ROLE) onlySender(userId, sender) {
+        /* 
+        Adds exp to user and checks if they have increased their level
+        Levels are calculated using Runescapes leveling, which requires
+        10.4% more exp each level
+        */ 
+        UserStruct memory user = userIdToUser[userId];
+        user.experience += exp;
+        if (user.experience >= user.expToNextLvl) {
+            user.level++;
+            user.expToNextLvl += (user.expToNextLvl * uint(1104)) / uint(1000);
+        }
+        userIdToUser[userId] = user;
+        emit userEvent(user, sender);
+    }    
+    
+    // For world ID
+    function claim(
+        address receiver,
+        uint256 root,
+        uint256 nullifierHash,
+        uint256[8] calldata proof
+    ) public {
+    // ) public onlyRole(MINTER_ROLE) onlySender(userId, receiver) {
+        /*
+        This function is called by JS dapp. 
+        If verification passes, then the user is awarded exp
+        */
+        if (nullifierHashes[nullifierHash]) revert InvalidNullifier();
+        semaphore.verifyProof(
+            root,
+            groupId,
+            abi.encodePacked(receiver).hashToField(),
+            nullifierHash,
+            abi.encodePacked(address(this)).hashToField(),
+            proof
+        );
+
+        nullifierHashes[nullifierHash] = true;
+    }
+
+    function changeRewards(Rewards memory _rewards) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        rewards = _rewards;
+    }
+
+    function getLevelAndExpNeeded(uint userId) public view returns(uint, uint) {
+        UserStruct memory user = userIdToUser[userId];
+        return (user.level, user.expToNextLvl);
+    }
+
+    function getScore(uint userId) public view returns(uint) {
+        // uint centralityScore = getCentralityScore(userId);
+        uint centralityScore = 5 * numDigits / 10;
+        uint userLevel = userIdToUser[userId].level;
+        uint userCaptureRate = userIdToUser[userId].captureRate;
+
+        return (userLevel * centralityScore * userCaptureRate) / numDigits / 100;
+    }
+
+    function setUserQuest(uint userId, uint questId) public onlyRole(MINTER_ROLE) {
+        userIdToUser[userId].dailyQuest = questId;
+    }
+
+    function getUserQuest(uint userId) public view returns(uint) {
+        return userIdToUser[userId].dailyQuest;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+library ByteHasher {
+    /// @dev Creates a keccak256 hash of a bytestring.
+    /// @param value The bytestring to hash
+    /// @return The hash of the specified value
+    /// @dev `>> 8` makes sure that the result is included in our field
+    function hashToField(bytes memory value) internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(value))) >> 8;
+    }
+}
+
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+
+interface ISemaphore {
+    /// @notice Reverts if the zero-knowledge proof is invalid.
+    /// @param root The of the Merkle tree
+    /// @param groupId The id of the Semaphore group
+    /// @param signalHash A keccak256 hash of the Semaphore signal
+    /// @param nullifierHash The nullifier hash
+    /// @param externalNullifierHash A keccak256 hash of the external nullifier
+    /// @param proof The zero-knowledge proof
+    /// @dev  Note that a double-signaling check is not included here, and should be carried by the caller.
+    function verifyProof(
+        uint256 root,
+        uint256 groupId,
+        uint256 signalHash,
+        uint256 nullifierHash,
+        uint256 externalNullifierHash,
+        uint256[8] calldata proof
+    ) external view;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "ERC721Sendable.sol";
+import "ERC721.sol";
+import "ERC721Burnable.sol";
+import "Counters.sol";
+import "AccessControl.sol";
+
+contract DAO is ERC721, ERC721Burnable, ERC721Sendable, AccessControl  {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    using Counters for Counters.Counter;
+
+    Counters.Counter private _tokenIdCounter;
+
+    struct Proposal {
+        uint proposalId;
+        uint userIdOfProposer;
+        string description;
+        uint blockMinted;
+        uint blockEnded;
+        bytes functionParameters;
+        string[] votingOptions;
+        uint[] optionsVoteCounts;
+        uint[] userIdsThatVoted;
+        uint bounty;
+    }
+
+    mapping(address => uint) public numProposals;
+    mapping(uint => Proposal) public idToProposal;
+    uint proposalCount;
+    event proposalMinted(Proposal proposal, address sender);
+    uint defaultBounty = 100;
+    uint numBlocksToVote = 43000;
+
+    constructor() ERC721("Proposal", "PRP") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _tokenIdCounter.increment();
+    }
+
+    // Overrides interface
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC721, AccessControl) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function grantMinterRole(address minter) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(MINTER_ROLE, minter);
+    }
+
+    function safeMint(address to) internal returns (uint256) {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        return tokenId;
+    }
+
+    function mintProposal(
+            uint userId, string memory description, bytes memory functionParameters, 
+            string[] memory votingOptions, address to
+        ) public onlyRole(MINTER_ROLE) 
+    {
+        uint256 tokenId = safeMint(to);
+        uint[] memory emptyList;
+        Proposal memory proposal = Proposal(
+            tokenId, userId, description, block.number, block.number + numBlocksToVote, 
+            functionParameters, votingOptions, emptyList, emptyList, defaultBounty
+        );
+        idToProposal[tokenId] = proposal;
+        proposalCount++;
+        numProposals[to]++;
+        emit proposalMinted(proposal, to);
+    }
+
+    function voteOnProposal(uint proposalId, uint userId, uint optionNumber, uint numVotes) public onlyRole(MINTER_ROLE) {
+        idToProposal[proposalId].optionsVoteCounts[optionNumber] += numVotes;
+        idToProposal[proposalId].userIdsThatVoted.push(userId);
+    }
+    
+    function sqrt(uint x) public view returns (uint y) {
+        uint z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function getStandardError(uint proposalId) public view returns(uint) {
+        Proposal memory proposal = idToProposal[proposalId];
+        uint totalVotes;
+        for (uint256 i; i < proposal.optionsVoteCounts.length; i++) {
+            totalVotes += proposal.optionsVoteCounts[i];
+        }
+        uint mean = totalVotes / proposal.optionsVoteCounts.length;
+        uint standardDeviation;
+        for (uint256 i; i < proposal.optionsVoteCounts.length; i++) {
+            standardDeviation += (proposal.optionsVoteCounts[i] - mean)**2;
+        }
+        standardDeviation /= totalVotes;
+        standardDeviation = sqrt(standardDeviation);
+        uint standardError = standardDeviation / sqrt(totalVotes);
+
+        return standardError;
+    }
+
+    function getBounty(uint proposalId) public returns(uint) {
+        // TODO: determine algorithm for bounty
+        
+        // return idToProposal[proposalId].bounty;
+        return 10;
+    }
+
+    function getPurposalResult(uint proposalId) public onlyRole(MINTER_ROLE) returns(uint, string memory, bytes memory) {
+        Proposal memory proposal = idToProposal[proposalId];
+        require(proposal.blockEnded < block.number, "Proposal still voting");
+        uint winningOption;
+        for (uint256 i = 1; i < proposal.optionsVoteCounts.length; i++) {
+            if (proposal.optionsVoteCounts[i] > proposal.optionsVoteCounts[winningOption]) {
+                winningOption = i;
+            }
+        }
+        return (winningOption, proposal.votingOptions[winningOption], proposal.functionParameters);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/** ****************************************************************************
+ * @notice Interface for contracts using VRF randomness
+ * *****************************************************************************
+ * @dev PURPOSE
+ *
+ * @dev Reggie the Random Oracle (not his real job) wants to provide randomness
+ * @dev to Vera the verifier in such a way that Vera can be sure he's not
+ * @dev making his output up to suit himself. Reggie provides Vera a public key
+ * @dev to which he knows the secret key. Each time Vera provides a seed to
+ * @dev Reggie, he gives back a value which is computed completely
+ * @dev deterministically from the seed and the secret key.
+ *
+ * @dev Reggie provides a proof by which Vera can verify that the output was
+ * @dev correctly computed once Reggie tells it to her, but without that proof,
+ * @dev the output is indistinguishable to her from a uniform random sample
+ * @dev from the output space.
+ *
+ * @dev The purpose of this contract is to make it easy for unrelated contracts
+ * @dev to talk to Vera the verifier about the work Reggie is doing, to provide
+ * @dev simple access to a verifiable source of randomness. It ensures 2 things:
+ * @dev 1. The fulfillment came from the VRFCoordinator
+ * @dev 2. The consumer contract implements fulfillRandomWords.
+ * *****************************************************************************
+ * @dev USAGE
+ *
+ * @dev Calling contracts must inherit from VRFConsumerBase, and can
+ * @dev initialize VRFConsumerBase's attributes in their constructor as
+ * @dev shown:
+ *
+ * @dev   contract VRFConsumer {
+ * @dev     constructor(<other arguments>, address _vrfCoordinator, address _link)
+ * @dev       VRFConsumerBase(_vrfCoordinator) public {
+ * @dev         <initialization with other arguments goes here>
+ * @dev       }
+ * @dev   }
+ *
+ * @dev The oracle will have given you an ID for the VRF keypair they have
+ * @dev committed to (let's call it keyHash). Create subscription, fund it
+ * @dev and your consumer contract as a consumer of it (see VRFCoordinatorInterface
+ * @dev subscription management functions).
+ * @dev Call requestRandomWords(keyHash, subId, minimumRequestConfirmations,
+ * @dev callbackGasLimit, numWords),
+ * @dev see (VRFCoordinatorInterface for a description of the arguments).
+ *
+ * @dev Once the VRFCoordinator has received and validated the oracle's response
+ * @dev to your request, it will call your contract's fulfillRandomWords method.
+ *
+ * @dev The randomness argument to fulfillRandomWords is a set of random words
+ * @dev generated from your requestId and the blockHash of the request.
+ *
+ * @dev If your contract could have concurrent requests open, you can use the
+ * @dev requestId returned from requestRandomWords to track which response is associated
+ * @dev with which randomness request.
+ * @dev See "SECURITY CONSIDERATIONS" for principles to keep in mind,
+ * @dev if your contract could have multiple requests in flight simultaneously.
+ *
+ * @dev Colliding `requestId`s are cryptographically impossible as long as seeds
+ * @dev differ.
+ *
+ * *****************************************************************************
+ * @dev SECURITY CONSIDERATIONS
+ *
+ * @dev A method with the ability to call your fulfillRandomness method directly
+ * @dev could spoof a VRF response with any random value, so it's critical that
+ * @dev it cannot be directly called by anything other than this base contract
+ * @dev (specifically, by the VRFConsumerBase.rawFulfillRandomness method).
+ *
+ * @dev For your users to trust that your contract's random behavior is free
+ * @dev from malicious interference, it's best if you can write it so that all
+ * @dev behaviors implied by a VRF response are executed *during* your
+ * @dev fulfillRandomness method. If your contract must store the response (or
+ * @dev anything derived from it) and use it later, you must ensure that any
+ * @dev user-significant behavior which depends on that stored value cannot be
+ * @dev manipulated by a subsequent VRF request.
+ *
+ * @dev Similarly, both miners and the VRF oracle itself have some influence
+ * @dev over the order in which VRF responses appear on the blockchain, so if
+ * @dev your contract could have multiple VRF requests in flight simultaneously,
+ * @dev you must ensure that the order in which the VRF responses arrive cannot
+ * @dev be used to manipulate your contract's user-significant behavior.
+ *
+ * @dev Since the block hash of the block which contains the requestRandomness
+ * @dev call is mixed into the input to the VRF *last*, a sufficiently powerful
+ * @dev miner could, in principle, fork the blockchain to evict the block
+ * @dev containing the request, forcing the request to be included in a
+ * @dev different block with a different hash, and therefore a different input
+ * @dev to the VRF. However, such an attack would incur a substantial economic
+ * @dev cost. This cost scales with the number of blocks the VRF oracle waits
+ * @dev until it calls responds to a request. It is for this reason that
+ * @dev that you can signal to an oracle you'd like them to wait longer before
+ * @dev responding to the request (however this is not enforced in the contract
+ * @dev and so remains effective only in the case of unmodified oracle software).
+ */
+abstract contract VRFConsumerBaseV2 {
+  error OnlyCoordinatorCanFulfill(address have, address want);
+  address private immutable vrfCoordinator;
+
+  /**
+   * @param _vrfCoordinator address of VRFCoordinator contract
+   */
+  constructor(address _vrfCoordinator) {
+    vrfCoordinator = _vrfCoordinator;
+  }
+
+  /**
+   * @notice fulfillRandomness handles the VRF response. Your contract must
+   * @notice implement it. See "SECURITY CONSIDERATIONS" above for important
+   * @notice principles to keep in mind when implementing your fulfillRandomness
+   * @notice method.
+   *
+   * @dev VRFConsumerBaseV2 expects its subcontracts to have a method with this
+   * @dev signature, and will call it once it has verified the proof
+   * @dev associated with the randomness. (It is triggered via a call to
+   * @dev rawFulfillRandomness, below.)
+   *
+   * @param requestId The Id initially returned by requestRandomness
+   * @param randomWords the VRF output expanded to the requested number of words
+   */
+  function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal virtual;
+
+  // rawFulfillRandomness is called by VRFCoordinator when it receives a valid VRF
+  // proof. rawFulfillRandomness then calls fulfillRandomness, after validating
+  // the origin of the call
+  function rawFulfillRandomWords(uint256 requestId, uint256[] memory randomWords) external {
+    if (msg.sender != vrfCoordinator) {
+      revert OnlyCoordinatorCanFulfill(msg.sender, vrfCoordinator);
+    }
+    fulfillRandomWords(requestId, randomWords);
+  }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface VRFCoordinatorV2Interface {
+  /**
+   * @notice Get configuration relevant for making requests
+   * @return minimumRequestConfirmations global min for request confirmations
+   * @return maxGasLimit global max for request gas limit
+   * @return s_provingKeyHashes list of registered key hashes
+   */
+  function getRequestConfig()
+    external
+    view
+    returns (
+      uint16,
+      uint32,
+      bytes32[] memory
+    );
+
+  /**
+   * @notice Request a set of random words.
+   * @param keyHash - Corresponds to a particular oracle job which uses
+   * that key for generating the VRF proof. Different keyHash's have different gas price
+   * ceilings, so you can select a specific one to bound your maximum per request cost.
+   * @param subId  - The ID of the VRF subscription. Must be funded
+   * with the minimum subscription balance required for the selected keyHash.
+   * @param minimumRequestConfirmations - How many blocks you'd like the
+   * oracle to wait before responding to the request. See SECURITY CONSIDERATIONS
+   * for why you may want to request more. The acceptable range is
+   * [minimumRequestBlockConfirmations, 200].
+   * @param callbackGasLimit - How much gas you'd like to receive in your
+   * fulfillRandomWords callback. Note that gasleft() inside fulfillRandomWords
+   * may be slightly less than this amount because of gas used calling the function
+   * (argument decoding etc.), so you may need to request slightly more than you expect
+   * to have inside fulfillRandomWords. The acceptable range is
+   * [0, maxGasLimit]
+   * @param numWords - The number of uint256 random values you'd like to receive
+   * in your fulfillRandomWords callback. Note these numbers are expanded in a
+   * secure way by the VRFCoordinator from a single random value supplied by the oracle.
+   * @return requestId - A unique identifier of the request. Can be used to match
+   * a request to a response in fulfillRandomWords.
+   */
+  function requestRandomWords(
+    bytes32 keyHash,
+    uint64 subId,
+    uint16 minimumRequestConfirmations,
+    uint32 callbackGasLimit,
+    uint32 numWords
+  ) external returns (uint256 requestId);
+
+  /**
+   * @notice Create a VRF subscription.
+   * @return subId - A unique subscription id.
+   * @dev You can manage the consumer set dynamically with addConsumer/removeConsumer.
+   * @dev Note to fund the subscription, use transferAndCall. For example
+   * @dev  LINKTOKEN.transferAndCall(
+   * @dev    address(COORDINATOR),
+   * @dev    amount,
+   * @dev    abi.encode(subId));
+   */
+  function createSubscription() external returns (uint64 subId);
+
+  /**
+   * @notice Get a VRF subscription.
+   * @param subId - ID of the subscription
+   * @return balance - LINK balance of the subscription in juels.
+   * @return reqCount - number of requests for this subscription, determines fee tier.
+   * @return owner - owner of the subscription.
+   * @return consumers - list of consumer address which are able to use this subscription.
+   */
+  function getSubscription(uint64 subId)
+    external
+    view
+    returns (
+      uint96 balance,
+      uint64 reqCount,
+      address owner,
+      address[] memory consumers
+    );
+
+  /**
+   * @notice Request subscription owner transfer.
+   * @param subId - ID of the subscription
+   * @param newOwner - proposed new owner of the subscription
+   */
+  function requestSubscriptionOwnerTransfer(uint64 subId, address newOwner) external;
+
+  /**
+   * @notice Request subscription owner transfer.
+   * @param subId - ID of the subscription
+   * @dev will revert if original owner of subId has
+   * not requested that msg.sender become the new owner.
+   */
+  function acceptSubscriptionOwnerTransfer(uint64 subId) external;
+
+  /**
+   * @notice Add a consumer to a VRF subscription.
+   * @param subId - ID of the subscription
+   * @param consumer - New consumer which can use the subscription
+   */
+  function addConsumer(uint64 subId, address consumer) external;
+
+  /**
+   * @notice Remove a consumer from a VRF subscription.
+   * @param subId - ID of the subscription
+   * @param consumer - Consumer to remove from the subscription
+   */
+  function removeConsumer(uint64 subId, address consumer) external;
+
+  /**
+   * @notice Cancel a subscription
+   * @param subId - ID of the subscription
+   * @param to - Where to send the remaining LINK to
+   */
+  function cancelSubscription(uint64 subId, address to) external;
+
+  /*
+   * @notice Check to see if there exists a request commitment consumers
+   * for all consumers and keyhashes for a given sub.
+   * @param subId - ID of the subscription
+   * @return true if there exists at least one unfulfilled request for the subscription, false
+   * otherwise.
+   */
+  function pendingRequestExists(uint64 subId) external view returns (bool);
+}
