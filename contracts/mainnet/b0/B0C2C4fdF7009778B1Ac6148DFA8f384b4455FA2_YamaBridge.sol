@@ -1,0 +1,2218 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./interfaces/ILayerZeroUserApplicationConfig.sol";
+import "./interfaces/ILayerZeroEndpoint.sol";
+import "./interfaces/IStargateRouter.sol";
+import "./lzApp/NonblockingLzApp.sol";
+import "./YamaRouter.sol";
+import "./swappers/Swapper.sol";
+
+
+contract YamaBridge is NonblockingLzApp {
+    event DepositSent(
+      address from,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 amount,
+      uint256 receiptId
+    );
+
+    event DepositConfirmed(
+      address from,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 lpTokenAmount,
+      uint256 receiptId
+    );
+
+    event DepositFailed(
+      address from,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 amount,
+      uint256 receiptId
+    );
+
+    event WithdrawalSent(
+      address to,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 lpTokenAmount,
+      uint256 receiptId
+    );
+
+    event WithdrawalReceived(
+      address to,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 amount,
+      uint256 receiptId
+    );
+
+    event WithdrawalFailed(
+      address from,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 lpTokenAmount,
+      uint256 receiptId
+    );
+
+    event StargateFailed(
+      address to,
+      uint16 chainId,
+      uint256 endpointId,
+      uint256 amount,
+      uint256 receiptId
+    );
+
+    enum Status {
+      PENDING,
+      SUCCESS,
+      FAIL,
+      STARGATE_FAIL  // Money couldn't be sent back (bridge may not have enough liquidity)
+    }
+
+    enum CrossChainCall {
+      DEPOSIT,
+      DEPOSIT_RESPONSE,
+      DEPOSIT_RESPONSE_FAIL,
+      WITHDRAW,
+      WITHDRAW_RESPONSE,
+      VERIFY_MSG, // For the LayerZero message that verifies a Stargate message
+      STARGATE_FAIL, // In case Stargate fails (e.g. due to lack of liquidity)
+      REDEEM_STUCK,
+      REDEEM_STUCK_RESPONSE
+    }
+
+    struct StargateMsg {
+      uint16 callType;
+      uint256 receiptId;
+      uint256 amount;
+      uint256 endpointId;
+      address srcAddress;
+      uint16 srcChainId;
+    }
+
+    struct SwapCallParams {
+      StargateMsg stargateMsg;
+      uint256 fee;
+      uint16 dstChainId;
+      address payable refundAddress;
+      IStargateRouter.lzTxObj lzTxObj;
+      bytes payload;
+    }
+
+    struct Bridge {
+      address bridge;
+      uint256 stargatePool;
+    }
+
+    enum ReceiptType {
+      DEPOSIT,
+      WITHDRAW
+    }
+
+    // Used for keeping track of cross-chain deposits/withdrawals.
+    struct Receipt {
+      ReceiptType receiptType;
+      address caller;
+
+      // If this is a deposit, this is the amount of underlying tokens sent.
+      // If this is a withdrawal, this is the amount of LP tokens sent.
+      uint256 amount;
+
+      IERC20 token;
+      uint256 endpointId;
+      uint16 dstChain;
+
+      // If successful deposit, this is the amount of LP tokens received.
+      // If failed deposit, this is the amount of underlying tokens refunded.
+      // If successful withdrawal, this is the amount of tokens withdrawn.
+      // If failed withdrawal, this is the amount of LP tokens refunded.
+      uint256 amountReceived;
+      Status status;
+      uint256 blockNumber;  // Block number when the receipt is created.
+    }
+
+    uint256 private constant blocksUntilFailed = 2000;
+    uint256 private constant gasLimit = 2300000;
+
+    // Stargate function types
+    uint8 private constant TYPE_SWAP_REMOTE            = 1;
+    uint8 private constant TYPE_ADD_LIQUIDITY          = 2;
+    uint8 private constant TYPE_REDEEM_LOCAL_CALL_BACK = 3;
+    uint8 private constant TYPE_WITHDRAW_REMOTE        = 4;
+
+    Receipt[] public receipts;
+
+    mapping(uint256 => Bridge) private bridges;
+
+    // How much money remote bridges have deposited into local endpoints.
+    // endpointId => (chainId => balance)
+    mapping(uint256 => mapping(uint256 => uint)) private bridgeBalances;
+
+    // LP token for each endpoint on a remote chain.
+    // chainId => (endpoint => LP token)
+    mapping(uint256 => mapping(uint256 => LPToken)) public remoteLPs;
+
+    // Stargate doesn't provide the source address in a trusted way.
+    // As a result, we send a separate message using LayerZero that
+    // authenticates the Stargate message.
+    // nonce => stargateMsg
+    mapping(uint256 => StargateMsg) private stargateMsgs;
+
+    // nonce => verifiedByLayerZero
+    mapping(uint256 => bool) private stargateMsgConfs;
+
+    // chainId => stablecoinDecimals
+    mapping(uint16 => uint8) private decimals;
+
+    // Used when a Stargate swap fails, so the money gets stuck on this chain.
+    // chainId => (receiptId => balance)
+    mapping(uint16 => mapping(uint256 => uint256)) private unclaimedBalances;
+
+    uint16 private chain;
+    uint256 private stargatePool;
+    IERC20 public stablecoin;
+    ILayerZeroEndpoint private layerZero;
+    IStargateRouter private stargate;
+    Swapper private swapper;
+    YamaRouter private router;
+
+    constructor(
+      uint16 _chain,
+      uint256 _stargatePool,
+      IERC20 _stablecoin,
+      ILayerZeroEndpoint _layerZero,
+      IStargateRouter _stargate,
+      Swapper _swapper,
+      YamaRouter _router
+    ) NonblockingLzApp(address(_layerZero)) {
+      chain = _chain;
+      stargatePool = _stargatePool;
+      stablecoin = _stablecoin;
+      layerZero = _layerZero;
+      stargate = _stargate;
+      swapper = _swapper;
+      router = _router;
+    }
+
+    receive() external payable {}
+
+    //
+    // External functions (other than for Stargate/LayerZero)
+    //
+
+    // Deposit money into a remote chain.
+    // The contract must have approval to transfer the given amount of the
+    // stablecoin.
+    function depositRemote(
+      uint16 dstChain,
+      uint256 endpoint,
+      uint256 amount
+    ) external payable returns (uint256 depositReceiptId) {
+      Receipt memory depositReceipt = Receipt(
+        ReceiptType.DEPOSIT,
+        msg.sender,
+        amount,
+        stablecoin,
+        endpoint,
+        dstChain,
+        0,
+        Status.PENDING,
+        block.number
+      );
+
+      depositReceiptId = _depositRemote(depositReceipt);
+
+      emit DepositSent(
+        msg.sender,
+        dstChain,
+        endpoint,
+        amount,
+        depositReceiptId
+      );
+    }
+
+    // Withdraw money from a foreign chain.
+    // The contract must have approval to transfer the given amount of LP
+    // tokens.
+    function withdrawRemote(
+      uint16 dstChain,
+      uint256 endpoint,
+      uint256 lpTokenAmount
+    ) external payable returns (uint256 withdrawReceiptId) {
+      Receipt memory withdrawReceipt = Receipt(
+        ReceiptType.WITHDRAW,
+        msg.sender,
+        lpTokenAmount,
+        stablecoin,
+        endpoint,
+        dstChain,
+        0,
+        Status.PENDING,
+        block.number
+      );
+      withdrawReceiptId = _withdrawRemote(withdrawReceipt);
+
+      emit WithdrawalSent(
+        msg.sender,
+        dstChain,
+        endpoint,
+        lpTokenAmount,
+        withdrawReceiptId
+      );
+    }
+
+    // This function can be used to refund withdrawal requests after
+    // blocksUntilFailed blocks if the withdrawal hasn't succeeded yet.
+    function refundFailedWithdrawal(uint256 receiptId) external returns (
+      uint256 lpTokenAmount
+    ) {
+      require(receipts[receiptId].receiptType == ReceiptType.WITHDRAW,
+        "Yama: Not a withdrawal");
+      require(receipts[receiptId].status == Status.PENDING,
+        "Yama: Withdrawal already processed");
+      require(receipts[receiptId].blockNumber + blocksUntilFailed <= (
+        block.number),
+        "Yama: Too early to refund withdrawal");
+      receipts[receiptId].status = Status.FAIL;
+      receipts[receiptId].amountReceived = receipts[receiptId].amount;
+      lpTokenAmount = receipts[receiptId].amount;
+      remoteLPs[receipts[receiptId].dstChain]
+               [receipts[receiptId].endpointId].mint(
+        receipts[receiptId].caller,
+        receipts[receiptId].amount
+      );
+
+      emit WithdrawalFailed(
+        receipts[receiptId].caller,
+        receipts[receiptId].dstChain,
+        receipts[receiptId].endpointId,
+        receipts[receiptId].amount,
+        receiptId
+      );
+    }
+
+    function addBridge(
+      uint16 _chain,
+      address _bridge,
+      uint256 _stargatePool,
+      uint8 _decimals
+    ) external onlyOwner {
+      require(bridges[_chain].bridge == address(0),
+        "Yama: Bridge already exists");
+
+      Bridge memory bridge;
+      bridge.bridge = _bridge;
+      bridge.stargatePool = _stargatePool;
+      bridges[_chain] = bridge;
+      setTrustedRemote(_chain, abi.encodePacked(_bridge));
+      decimals[_chain] = _decimals;
+    }
+
+    function depositFee(uint16 dstChain) external view returns (uint256 fee) {
+      return estimateStargateNoVerifyFee(dstChain);
+    }
+
+    function withdrawFee(uint16 dstChain) external view returns (uint256 fee) {
+      return estimateLayerZeroFee(dstChain);
+    }
+
+    function redeemStuckFee(uint16 dstChain) external view returns (
+      uint256 fee
+    ) {
+      return estimateLayerZeroFee(dstChain);
+    }
+
+    // Redeem money that couldn't be sent back earlier, possibly due to a
+    // lack of bridge liquidity.
+    function redeemStuck(uint256 receiptId) external payable {
+      require(receipts[receiptId].caller == msg.sender,
+        "Yama: Caller did not create the receipt.");
+      require(receipts[receiptId].status == Status.STARGATE_FAIL,
+        "Yama: No stuck funds on destination chain.");
+
+      sendLayerZero(
+        receipts[receiptId].dstChain,
+        CrossChainCall.REDEEM_STUCK,
+        receiptId,
+        0,
+        0,
+        msg.value,
+        payable(msg.sender)
+      );
+    }
+
+    //
+    // Internal/receive functions
+    //
+
+    // Use input array because only 16 elements can be pushed to the stack.
+    function _depositRemote(Receipt memory depositReceipt) internal returns (
+      uint256 depositReceiptId) {
+        {
+          receipts.push(depositReceipt);
+          depositReceiptId = receipts.length - 1;
+          depositReceipt.token.transferFrom(
+            msg.sender,
+            address(this),
+            depositReceipt.amount
+          );
+        }
+
+        sendStargateNoVerify(
+          uint16(CrossChainCall.DEPOSIT),
+          depositReceipt.dstChain,
+          depositReceiptId,
+          depositReceipt.endpointId,
+          depositReceipt.amount,
+          msg.value,
+          payable(msg.sender)
+        );
+    }
+
+    function _withdrawRemote(
+      Receipt memory withdrawReceipt
+    ) internal returns (
+      uint256 withdrawReceiptId
+    ) {
+      remoteLPs[withdrawReceipt.dstChain][withdrawReceipt.endpointId].burn(
+        msg.sender,
+        withdrawReceipt.amount
+      );
+
+      receipts.push(withdrawReceipt);
+      withdrawReceiptId = receipts.length - 1;
+
+      sendLayerZero(
+        withdrawReceipt.dstChain,
+        CrossChainCall.WITHDRAW,
+        withdrawReceiptId,
+        withdrawReceipt.amount,
+        withdrawReceipt.endpointId,
+        msg.value,
+        payable(msg.sender)
+      );
+    }
+
+    function sgProcessParams(bytes memory payload) internal pure returns (
+      uint16 callType, uint256 receiptId, address srcAddress,
+      uint256 endpointId
+    ) {
+        return abi.decode(payload, (uint16, uint256, address, uint256));
+    }
+
+    function estimateLayerZeroFee(
+        uint16 dstChain) internal view returns (uint256 fee) {
+      bytes memory sample_payload = generateLzPayload(
+        CrossChainCall.DEPOSIT_RESPONSE,
+        0,
+        0,
+        0
+      );
+      bytes memory adapterParams = abi.encodePacked(
+        uint16(1),
+        uint256(gasLimit)
+      );
+
+      (fee,) = layerZero.estimateFees(
+        dstChain,
+        address(this),
+        sample_payload,
+        false,
+        adapterParams
+      );
+    }
+
+    function generateLzPayload(
+      CrossChainCall callType,
+      uint256 receiptId,
+      uint256 amount,
+      uint256 endpoint
+    ) internal pure returns (bytes memory) {
+      return abi.encode(
+        uint16(callType),
+        receiptId,
+        amount,
+        endpoint
+      );
+    }
+
+    function sendLayerZero(
+      uint16 dstChainId,
+      address payable refundAddress,
+      uint256 fee,
+      bytes memory payload
+    ) internal {
+      bytes memory adapterParams = abi.encodePacked(
+        uint16(1),
+        uint256(gasLimit)
+      );
+
+      layerZero.send{value:fee}(
+        dstChainId,
+        abi.encodePacked(bridges[dstChainId].bridge),
+        payload,
+        refundAddress,
+        address(0),
+        adapterParams
+      );
+    }
+
+    function sendLayerZero(
+      uint16 dstChainId,
+      CrossChainCall callType,
+      uint256 receiptId,
+      uint256 amount,
+      uint256 endpointId,
+      uint256 fee,
+      address payable refundAddress
+    ) internal {
+      sendLayerZero(
+        dstChainId,
+        refundAddress,
+        fee,
+        generateLzPayload(
+          callType,
+          receiptId,
+          amount,
+          endpointId
+        )
+      );
+    }
+
+    function failDeposit(StargateMsg memory stargateMsg) internal {
+      stablecoin.approve(address(swapper), stargateMsg.amount);
+      uint256 sgFee = estimateStargateFee(stargateMsg.srcChainId);
+      stargateMsg.amount -= swapper.swapToNative(stablecoin, sgFee,
+        stargateMsg.amount);
+
+      sendStargate(
+        uint16(CrossChainCall.DEPOSIT_RESPONSE_FAIL),
+        uint16(stargateMsg.srcChainId),
+        stargateMsg.receiptId,
+        stargateMsg.amount,
+        stargateMsg.endpointId
+      );
+    }
+
+    function handleDeposit(
+      StargateMsg memory stargateMsg
+    ) internal {
+      if (router.getEndpointToken(stargateMsg.endpointId) != stablecoin) {
+        failDeposit(stargateMsg);
+        return;
+      }
+      uint256 lzFee = estimateLayerZeroFee(uint16(stargateMsg.srcChainId));
+
+      stablecoin.approve(address(swapper), stargateMsg.amount);
+      stargateMsg.amount -= swapper.swapToNative(stablecoin, lzFee,
+        stargateMsg.amount);
+
+      stablecoin.approve(address(router), stargateMsg.amount);
+
+      try router.deposit(
+        stargateMsg.endpointId,
+        stargateMsg.amount
+      ) returns (uint256 deposited) {
+        bridgeBalances[stargateMsg.endpointId]
+          [stargateMsg.srcChainId] += deposited;
+
+        sendLayerZero(
+          uint16(stargateMsg.srcChainId),
+          CrossChainCall.DEPOSIT_RESPONSE,
+          stargateMsg.receiptId,
+          deposited,
+          stargateMsg.endpointId,
+          lzFee,
+          payable(owner())
+        );
+      } catch {
+        failDeposit(stargateMsg);
+      }
+    }
+
+    // The Stargate receiver.
+    // A router on another chain is trying to deposit money on an endpoint on
+    // this chain.
+    function sgReceive(
+        uint16 _srcChainId,              // the remote chainId sending the tokens
+        bytes memory _srcAddress,        // the remote Bridge address
+        uint256 _nonce,
+        address _token,                  // the token contract on the local chain
+        uint256 amountLD,                // the qty of local _token contract tokens
+        bytes memory payload
+    ) external {
+      require(msg.sender == address(stargate),
+        "Yama: Only Stargate can call sgReceive");
+      require(_token == address(stablecoin),
+        "Yama: Invalid token");
+      (uint16 callType, uint256 receiptId,
+        address srcAddress,
+        uint256 endpointId) = sgProcessParams(payload);
+
+      StargateMsg memory stargateMsg = StargateMsg(
+        callType,
+        receiptId,
+        amountLD,
+        endpointId,
+        srcAddress,
+        _srcChainId
+      );
+
+      // We don't need to verify deposits. No one can harm the protocol by
+      // forging deposits.
+      if (callType == uint16(CrossChainCall.DEPOSIT)) {
+        handleDeposit(
+          stargateMsg
+        );
+
+      } else {
+        if (stargateMsgConfs[_nonce]) {
+          processStargateMsg(stargateMsg);
+          delete stargateMsgConfs[_nonce];
+        } else {
+          stargateMsgs[_nonce] = stargateMsg;
+        }
+      }
+    }
+
+    function estimateStargateFee(uint16 dstChainId) internal view returns (
+      uint256 fee) {
+        return estimateStargateNoVerifyFee(dstChainId) + estimateLayerZeroFee(
+          dstChainId);
+      }
+
+    function estimateStargateNoVerifyFee(
+      uint16 dstChainId) internal view returns (uint256 fee) {
+
+      bytes memory payload = generateSgPayload(
+        CrossChainCall.DEPOSIT,
+        0,
+        0
+      );
+
+      IStargateRouter.lzTxObj memory lzTxObj = IStargateRouter.lzTxObj(
+        gasLimit,
+        0,
+        "0x"
+      );
+
+      (fee,) = stargate.quoteLayerZeroFee(
+        dstChainId,
+        TYPE_SWAP_REMOTE,
+        abi.encodePacked(bridges[dstChainId].bridge),
+        payload,
+        lzTxObj
+      );
+    }
+
+    function sendStargateNoVerify(
+      uint16 callType,
+      uint16 dstChainId,
+      uint256 receiptId,
+      uint256 endpointId,
+      uint256 amount,
+      uint256 fee,
+      address payable refundAddress
+    ) internal returns (bool successful) {
+      StargateMsg memory stargateMsg = StargateMsg(
+        callType,
+        receiptId,
+        amount,
+        endpointId,
+        address(this),
+        chain
+      );
+
+      return sendStargateNoVerify(
+        stargateMsg,
+        fee,
+        dstChainId,
+        refundAddress
+      );
+    }
+
+    function generateSgPayload(
+      CrossChainCall callType,
+      uint256 receiptId,
+      uint256 endpointId
+    ) internal view returns (bytes memory) {
+      return abi.encode(
+        uint16(callType),
+        receiptId,
+        address(this),
+        endpointId
+      );
+    }
+
+    function swapCall(
+      SwapCallParams memory params
+    ) internal returns (bool successful) {
+      try stargate.swap{value:params.fee}(
+        params.dstChainId,
+        stargatePool,
+        bridges[params.dstChainId].stargatePool,
+        params.refundAddress,
+        params.stargateMsg.amount,
+        0,
+        params.lzTxObj,
+        abi.encodePacked(bridges[params.dstChainId].bridge),
+        params.payload
+      ) {
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function sendStargateNoVerify(
+      StargateMsg memory stargateMsg,
+      uint256 fee,
+      uint16 dstChainId,
+      address payable refundAddress
+    ) internal returns (bool successful) {
+      IStargateRouter.lzTxObj memory lzTxObj = IStargateRouter.lzTxObj(
+        gasLimit,
+        0,
+        "0x"
+      );
+
+      bytes memory payload = generateSgPayload(
+        CrossChainCall(stargateMsg.callType),
+        stargateMsg.receiptId,
+        stargateMsg.endpointId
+      );
+
+      stablecoin.approve(
+        address(stargate),
+        stargateMsg.amount
+      );
+
+      SwapCallParams memory params = SwapCallParams(
+        stargateMsg,
+        fee,
+        dstChainId,
+        refundAddress,
+        lzTxObj,
+        payload
+      );
+
+      return swapCall(params);
+    }
+
+    function sendStargate(
+      uint16 callType,
+      uint16 dstChainId,
+      uint256 receiptId,
+      uint256 amount,
+      uint256 endpointId
+    ) internal returns (bool successful) {
+      StargateMsg memory stargateMsg = StargateMsg(
+        callType,
+        receiptId,
+        amount,
+        endpointId,
+        address(this),
+        chain
+      );
+
+      uint256 fee = estimateStargateNoVerifyFee(dstChainId);
+
+      successful = sendStargateNoVerify(
+        stargateMsg,
+        fee,
+        dstChainId,
+        payable(owner())
+      );
+      fee = estimateLayerZeroFee(dstChainId);
+
+      if (!successful) {
+        unclaimedBalances[dstChainId][receiptId] = amount;
+
+        sendLayerZero(
+          dstChainId,
+          CrossChainCall.STARGATE_FAIL,
+          receiptId,
+          amount,
+          endpointId,
+          fee,
+          payable(owner())
+        );
+        return false;
+      }
+
+      // Verification using LayerZero.
+      bytes memory payload = generateLzPayload(
+        CrossChainCall.VERIFY_MSG,
+        uint256(layerZero.getOutboundNonce(dstChainId, stargate.bridge())),
+        0,
+        0
+      );
+
+      sendLayerZero(
+        dstChainId,
+        payable(owner()),
+        fee,
+        payload
+      );
+    }
+
+    function handleWithdraw(
+      uint256 receiptId,
+      uint256 amount,
+      uint256 endpoint,
+      uint16 _srcChainId,
+      bytes memory _srcAddress
+    ) internal {
+      require(bridgeBalances[endpoint][_srcChainId] >= amount,
+        "Yama: Insufficient source chain balance");
+      bridgeBalances[endpoint][_srcChainId] -= amount;
+
+      uint256 withdrawn = router.withdraw(endpoint, amount);
+
+      uint256 fee = estimateStargateFee(_srcChainId);
+
+      stablecoin.approve(address(swapper), withdrawn);
+      withdrawn -= swapper.swapToNative(stablecoin, fee, withdrawn);
+
+      sendStargate(
+        uint16(CrossChainCall.WITHDRAW_RESPONSE),
+        _srcChainId,
+        receiptId,
+        withdrawn,
+        endpoint
+      );
+    }
+
+    function processStargateMsg(StargateMsg memory stargateMsg) internal {
+      if (stargateMsg.callType == uint16(
+          CrossChainCall.DEPOSIT_RESPONSE_FAIL)
+        ) {
+        receipts[stargateMsg.receiptId].status = Status.FAIL;
+        receipts[stargateMsg.receiptId].amountReceived = stargateMsg.amount;
+
+        stablecoin.transfer(
+          receipts[stargateMsg.receiptId].caller,
+          stargateMsg.amount
+        );
+
+        emit DepositFailed(
+          receipts[stargateMsg.receiptId].caller,
+          stargateMsg.srcChainId,
+          stargateMsg.endpointId,
+          stargateMsg.amount,
+          stargateMsg.receiptId
+        );
+      } else if (stargateMsg.callType == uint16(
+          CrossChainCall.WITHDRAW_RESPONSE)
+        ) {
+        receipts[stargateMsg.receiptId].status = Status.SUCCESS;
+        receipts[stargateMsg.receiptId].amountReceived = stargateMsg.amount;
+
+        stablecoin.transfer(
+          receipts[stargateMsg.receiptId].caller,
+          stargateMsg.amount
+        );
+
+        emit WithdrawalReceived(
+          receipts[stargateMsg.receiptId].caller,
+          stargateMsg.srcChainId,
+          stargateMsg.endpointId,
+          stargateMsg.amount,
+          stargateMsg.receiptId
+        );
+      } else if (stargateMsg.callType == uint16(
+        CrossChainCall.REDEEM_STUCK_RESPONSE)
+      ) {
+        receipts[stargateMsg.receiptId].amountReceived = stargateMsg.amount;
+
+        stablecoin.transfer(
+          receipts[stargateMsg.receiptId].caller,
+          stargateMsg.amount
+        );
+
+        // If this is a deposit receipt, the money was sent back because the
+        // deposit failed. If it's a withdrawal, it succeeded.
+        if (receipts[stargateMsg.receiptId].receiptType == ReceiptType.DEPOSIT
+        ) {
+          receipts[stargateMsg.receiptId].status = Status.FAIL;
+
+          emit DepositFailed(
+            receipts[stargateMsg.receiptId].caller,
+            stargateMsg.srcChainId,
+            receipts[stargateMsg.receiptId].endpointId,
+            stargateMsg.amount,
+            stargateMsg.receiptId
+          );
+        } else {
+          receipts[stargateMsg.receiptId].status = Status.SUCCESS;
+
+          emit WithdrawalReceived(
+            receipts[stargateMsg.receiptId].caller,
+            stargateMsg.srcChainId,
+            receipts[stargateMsg.receiptId].endpointId,
+            stargateMsg.amount,
+            stargateMsg.receiptId
+          );
+        }
+      }
+    }
+
+    function processLzParams(bytes memory payload) internal pure returns (
+      uint16 callType, uint256 receiptId, uint256 amount, uint256 endpoint) {
+      return abi.decode(payload, (uint16, uint256, uint256, uint256));
+    }
+
+    function handleStargateFail(
+      uint256 receiptId,
+      uint256 amount,
+      uint256 endpointId,
+      uint16 chainId
+    ) internal {
+      receipts[receiptId].status = Status.STARGATE_FAIL;
+      receipts[receiptId].amountReceived = amount;
+
+      emit StargateFailed(
+        receipts[receiptId].caller,
+        chainId,
+        endpointId,
+        amount,
+        receiptId
+      );
+    }
+
+    function handleRedemption(
+      uint16 chainId,
+      uint256 receiptId
+    ) internal {
+      uint256 amount = unclaimedBalances[chainId][receiptId];
+      unclaimedBalances[chainId][receiptId] = 0;
+      require(amount > 0,
+        "Yama: Balance has already been claimed.");
+      uint256 fee = estimateStargateFee(chainId);
+
+      stablecoin.approve(address(swapper), amount);
+      amount -= swapper.swapToNative(stablecoin, fee, amount);
+
+      sendStargate(
+        uint16(CrossChainCall.REDEEM_STUCK_RESPONSE),
+        chainId,
+        receiptId,
+        amount,
+        0
+      );
+    }
+
+
+    // What may be received using this function:
+    // Deposit request response
+    // Withdrawal request
+
+    // Payload data:
+    // [uint16] Call type
+    // [uint256] deposit ID or withdrawal request ID
+    // [uint256] amount of endpoint tokens issued after deposit or amount that
+    // should be withdrawn
+
+    // @notice LayerZero endpoint will invoke this function to deliver the message on the destination
+    // @param _srcChainId - the source endpoint identifier
+    // @param _srcAddress - the source sending contract address from the source chain
+    // @param _nonce - the ordered message nonce
+    // @param _payload - the signed payload is the UA bytes has encoded to be sent
+    function _nonblockingLzReceive(
+      uint16 _srcChainId,
+      bytes memory _srcAddress,
+      uint64 _nonce,
+      bytes memory _payload
+    ) internal override {
+      (uint16 callType, uint256 receiptId, uint256 amount, uint256 endpoint) =
+      processLzParams(_payload);
+      if (callType == uint16(CrossChainCall.VERIFY_MSG)) {
+        uint256 nonce = receiptId;
+
+        // If mapping exists, srcAddress != 0
+        if (stargateMsgs[nonce].srcAddress != address(0)) {
+          processStargateMsg(stargateMsgs[nonce]);
+          delete stargateMsgs[nonce];
+        } else {
+          stargateMsgConfs[nonce] = true;
+        }
+        return;
+      }
+
+      if (callType == uint16(CrossChainCall.DEPOSIT_RESPONSE)) {
+        endpoint = receipts[receiptId].endpointId;
+
+        if (address(remoteLPs[_srcChainId][endpoint]) == address(0)) {
+          remoteLPs[_srcChainId][endpoint] = router.createLPToken(
+            "External Yama LP",
+            "EYAMA",
+            address(0),
+            decimals[_srcChainId]
+          );
+        }
+        remoteLPs[_srcChainId][endpoint].mint(
+          receipts[receiptId].caller,
+          amount
+        );
+        receipts[receiptId].amountReceived = amount;
+        receipts[receiptId].status = Status.SUCCESS;
+
+        emit DepositConfirmed(
+          receipts[receiptId].caller,
+          _srcChainId,
+          endpoint,
+          amount,
+          receiptId
+        );
+      } else if (callType == uint16(CrossChainCall.WITHDRAW)) {
+        handleWithdraw(
+          receiptId,
+          amount,
+          endpoint,
+          _srcChainId,
+          _srcAddress
+        );
+      } else if (callType == uint16(CrossChainCall.STARGATE_FAIL)) {
+        handleStargateFail(
+          receiptId,
+          amount,
+          endpoint,
+          _srcChainId
+        );
+      } else if (callType == uint16(CrossChainCall.REDEEM_STUCK)) {
+        handleRedemption(_srcChainId, receiptId);
+      }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC20.sol";
+import "./extensions/IERC20Metadata.sol";
+import "../../utils/Context.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * The default value of {decimals} is 18. To select a different value for
+     * {decimals} you should overload it.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the value {ERC20} uses, unless this function is
+     * overridden;
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, allowance(owner, spender) + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = allowance(owner, spender);
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `sender` to `recipient`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+        }
+        _balances[to] += amount;
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        _balances[account] += amount;
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+        }
+        _totalSupply -= amount;
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.13;
+
+interface ILayerZeroUserApplicationConfig {
+    // @notice set the configuration of the LayerZero messaging library of the specified version
+    // @param _version - messaging library version
+    // @param _chainId - the chainId for the pending config change
+    // @param _configType - type of configuration. every messaging library has its own convention.
+    // @param _config - configuration in the bytes. can encode arbitrary content.
+    function setConfig(uint16 _version, uint16 _chainId, uint _configType, bytes calldata _config) external;
+
+    // @notice set the send() LayerZero messaging library version to _version
+    // @param _version - new messaging library version
+    function setSendVersion(uint16 _version) external;
+
+    // @notice set the lzReceive() LayerZero messaging library version to _version
+    // @param _version - new messaging library version
+    function setReceiveVersion(uint16 _version) external;
+
+    // @notice Only when the UA needs to resume the message flow in blocking mode and clear the stored payload
+    // @param _srcChainId - the chainId of the source chain
+    // @param _srcAddress - the contract address of the source contract at the source chain
+    function forceResumeReceive(uint16 _srcChainId, bytes calldata _srcAddress) external;
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.13;
+
+import "./ILayerZeroUserApplicationConfig.sol";
+
+interface ILayerZeroEndpoint is ILayerZeroUserApplicationConfig {
+    // @notice send a LayerZero message to the specified address at a LayerZero endpoint.
+    // @param _dstChainId - the destination chain identifier
+    // @param _destination - the address on destination chain (in bytes). address length/format may vary by chains
+    // @param _payload - a custom bytes payload to send to the destination contract
+    // @param _refundAddress - if the source transaction is cheaper than the amount of value passed, refund the additional amount to this address
+    // @param _zroPaymentAddress - the address of the ZRO token holder who would pay for the transaction
+    // @param _adapterParams - parameters for custom functionality. e.g. receive airdropped native gas from the relayer on destination
+    function send(uint16 _dstChainId, bytes calldata _destination, bytes calldata _payload, address payable _refundAddress, address _zroPaymentAddress, bytes calldata _adapterParams) external payable;
+
+    // @notice used by the messaging library to publish verified payload
+    // @param _srcChainId - the source chain identifier
+    // @param _srcAddress - the source contract (as bytes) at the source chain
+    // @param _dstAddress - the address on destination chain
+    // @param _nonce - the unbound message ordering nonce
+    // @param _gasLimit - the gas limit for external contract execution
+    // @param _payload - verified payload to send to the destination contract
+    function receivePayload(uint16 _srcChainId, bytes calldata _srcAddress, address _dstAddress, uint64 _nonce, uint _gasLimit, bytes calldata _payload) external;
+
+    // @notice get the inboundNonce of a lzApp from a source chain which could be EVM or non-EVM chain
+    // @param _srcChainId - the source chain identifier
+    // @param _srcAddress - the source chain contract address
+    function getInboundNonce(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (uint64);
+
+    // @notice get the outboundNonce from this source chain which, consequently, is always an EVM
+    // @param _srcAddress - the source chain contract address
+    function getOutboundNonce(uint16 _dstChainId, address _srcAddress) external view returns (uint64);
+
+    // @notice gets a quote in source native gas, for the amount that send() requires to pay for message delivery
+    // @param _dstChainId - the destination chain identifier
+    // @param _userApplication - the user app address on this EVM chain
+    // @param _payload - the custom message to send over LayerZero
+    // @param _payInZRO - if false, user app pays the protocol fee in native token
+    // @param _adapterParam - parameters for the adapter service, e.g. send some dust native token to dstChain
+    function estimateFees(uint16 _dstChainId, address _userApplication, bytes calldata _payload, bool _payInZRO, bytes calldata _adapterParam) external view returns (uint nativeFee, uint zroFee);
+
+    // @notice get this Endpoint's immutable source identifier
+    function getChainId() external view returns (uint16);
+
+    // @notice the interface to retry failed message on this Endpoint destination
+    // @param _srcChainId - the source chain identifier
+    // @param _srcAddress - the source chain contract address
+    // @param _payload - the payload to be retried
+    function retryPayload(uint16 _srcChainId, bytes calldata _srcAddress, bytes calldata _payload) external;
+
+    // @notice query if any STORED payload (message blocking) at the endpoint.
+    // @param _srcChainId - the source chain identifier
+    // @param _srcAddress - the source chain contract address
+    function hasStoredPayload(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (bool);
+
+    // @notice query if the _libraryAddress is valid for sending msgs.
+    // @param _userApplication - the user app address on this EVM chain
+    function getSendLibraryAddress(address _userApplication) external view returns (address);
+
+    // @notice query if the _libraryAddress is valid for receiving msgs.
+    // @param _userApplication - the user app address on this EVM chain
+    function getReceiveLibraryAddress(address _userApplication) external view returns (address);
+
+    // @notice query if the non-reentrancy guard for send() is on
+    // @return true if the guard is on. false otherwise
+    function isSendingPayload() external view returns (bool);
+
+    // @notice query if the non-reentrancy guard for receive() is on
+    // @return true if the guard is on. false otherwise
+    function isReceivingPayload() external view returns (bool);
+
+    // @notice get the configuration of the LayerZero messaging library of the specified version
+    // @param _version - messaging library version
+    // @param _chainId - the chainId for the pending config change
+    // @param _userApplication - the contract address of the user application
+    // @param _configType - type of configuration. every messaging library has its own convention.
+    function getConfig(uint16 _version, uint16 _chainId, address _userApplication, uint _configType) external view returns (bytes memory);
+
+    // @notice get the send() LayerZero messaging library version
+    // @param _userApplication - the contract address of the user application
+    function getSendVersion(address _userApplication) external view returns (uint16);
+
+    // @notice get the lzReceive() LayerZero messaging library version
+    // @param _userApplication - the contract address of the user application
+    function getReceiveVersion(address _userApplication) external view returns (uint16);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+interface IStargateRouter {
+    function bridge() external returns (address);
+
+    struct lzTxObj {
+        uint256 dstGasForCall;
+        uint256 dstNativeAmount;
+        bytes dstNativeAddr;
+    }
+
+    function addLiquidity(
+        uint256 _poolId,
+        uint256 _amountLD,
+        address _to
+    ) external;
+
+    function swap(
+        uint16 _dstChainId,
+        uint256 _srcPoolId,
+        uint256 _dstPoolId,
+        address payable _refundAddress,
+        uint256 _amountLD,
+        uint256 _minAmountLD,
+        lzTxObj memory _lzTxParams,
+        bytes calldata _to,
+        bytes calldata _payload
+    ) external payable;
+
+    function redeemRemote(
+        uint16 _dstChainId,
+        uint256 _srcPoolId,
+        uint256 _dstPoolId,
+        address payable _refundAddress,
+        uint256 _amountLP,
+        uint256 _minAmountLD,
+        bytes calldata _to,
+        lzTxObj memory _lzTxParams
+    ) external payable;
+
+    function instantRedeemLocal(
+        uint16 _srcPoolId,
+        uint256 _amountLP,
+        address _to
+    ) external returns (uint256);
+
+    function redeemLocal(
+        uint16 _dstChainId,
+        uint256 _srcPoolId,
+        uint256 _dstPoolId,
+        address payable _refundAddress,
+        uint256 _amountLP,
+        bytes calldata _to,
+        lzTxObj memory _lzTxParams
+    ) external payable;
+
+    function sendCredits(
+        uint16 _dstChainId,
+        uint256 _srcPoolId,
+        uint256 _dstPoolId,
+        address payable _refundAddress
+    ) external payable;
+
+    function quoteLayerZeroFee(
+        uint16 _dstChainId,
+        uint8 _functionType,
+        bytes calldata _toAddress,
+        bytes calldata _transferAndCallPayload,
+        lzTxObj memory _lzTxParams
+    ) external view returns (uint256, uint256);
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "./LzApp.sol";
+
+/*
+ * the default LayerZero messaging behaviour is blocking, i.e. any failed message will block the channel
+ * this abstract class try-catch all fail messages and store locally for future retry. hence, non-blocking
+ * NOTE: if the srcAddress is not configured properly, it will still block the message pathway from (srcChainId, srcAddress)
+ */
+abstract contract NonblockingLzApp is LzApp {
+    constructor(address _endpoint) LzApp(_endpoint) {}
+
+    mapping(uint16 => mapping(bytes => mapping(uint64 => bytes32))) public failedMessages;
+
+    event MessageFailed(uint16 _srcChainId, bytes _srcAddress, uint64 _nonce, bytes _payload);
+
+    // overriding the virtual function in LzReceiver
+    function _blockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual override {
+        // try-catch all errors/exceptions
+        try this.nonblockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload) {
+            // do nothing
+        } catch {
+            // error / exception
+            failedMessages[_srcChainId][_srcAddress][_nonce] = keccak256(_payload);
+            emit MessageFailed(_srcChainId, _srcAddress, _nonce, _payload);
+        }
+    }
+
+    function nonblockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) public virtual {
+        // only internal transaction
+        require(_msgSender() == address(this), "NonblockingLzApp: caller must be LzApp");
+        _nonblockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+    }
+
+    //@notice override this function
+    function _nonblockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual;
+
+    function retryMessage(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) public payable virtual {
+        // assert there is message to retry
+        bytes32 payloadHash = failedMessages[_srcChainId][_srcAddress][_nonce];
+        require(payloadHash != bytes32(0), "NonblockingLzApp: no stored message");
+        require(keccak256(_payload) == payloadHash, "NonblockingLzApp: invalid payload");
+        // clear the stored message
+        failedMessages[_srcChainId][_srcAddress][_nonce] = bytes32(0);
+        // execute the message. revert if it fails again
+        _nonblockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "./interfaces/IERC20Detailed.sol";
+
+
+interface IEndpoint {
+  function withdrawableAmount() external view returns (uint256);
+
+  function expectedAPY() external view returns (uint256);
+
+  // Called when tokens have been deposited into the pool.
+  // Should verify that the router contract is calling.
+  function deposit(uint256 amount) external;
+
+  // Called when tokens are being withdrawn from the pool.
+  // Must give approval to the lending pool contract to transfer the tokens.
+  // Otherwise, a default is declared.
+  // Should verify that the router contract is calling.
+  function withdraw(uint256 amount) external returns (uint256 withdrawn);
+}
+
+contract LPToken is ERC20, Ownable {
+  IERC20Detailed underlying;
+  uint8 private _decimals;
+
+  constructor(
+    string memory _name,
+    string memory _symbol,
+    address _underlying,
+    uint8 __decimals
+  ) ERC20(_name, _symbol) {
+    underlying = IERC20Detailed(_underlying);
+    _decimals = __decimals;
+  }
+
+  function decimals() public override view returns (uint8) {
+    if (address(underlying) != address(0)) {
+      return underlying.decimals();
+    } else {
+      return _decimals;
+    }
+  }
+
+  function mint(address account, uint256 amount) external onlyOwner {
+    _mint(account, amount);
+  }
+
+  function burn(address account, uint256 amount) external onlyOwner {
+    _burn(account, amount);
+  }
+}
+
+contract YamaRouter is Ownable {
+  event Deposited(
+    address from,
+    uint256 endpointId,
+    uint256 underlyingAmount,
+    uint256 lpTokenAmount
+  );
+
+  event Withdrawn(
+    address from,
+    uint256 endpointId,
+    uint256 underlyingAmount,
+    uint256 lpTokenAmount
+  );
+
+  event EndpointAdded(
+    address from,
+    uint256 endpointId,
+    string name,
+    string symbol,
+    address token
+  );
+
+  struct Endpoint {
+    IEndpoint endpoint;
+    string name;
+    uint256 minEndpointRatio;
+    IERC20 token;
+    LPToken lpToken;
+    bool verified;
+  }
+
+  uint256 public constant decimals = 18;
+  uint256 public immutable protocolFee;  // in terms of decimals
+  Endpoint[] public endpoints;
+  mapping(string => uint256) public verifiedEndpoints;
+
+  constructor(
+    uint256 _protocolFee
+  ) {
+    protocolFee = _protocolFee;
+  }
+
+  function getEndpointToken(
+    uint256 endpointId) external view returns (IERC20 token) {
+    return endpoints[endpointId].token;
+  }
+
+  function getEndpointLPToken(
+    uint256 endpointId) external view returns (LPToken lpToken) {
+    return endpoints[endpointId].lpToken;
+  }
+
+  // Only available for some endpoints.
+  function getExpectedAPY(uint256 endpointId) external view returns (uint256) {
+    return endpoints[endpointId].endpoint.expectedAPY();
+  }
+
+  function endpointsLength() public view returns (uint256 length) {
+    return endpoints.length;
+  }
+
+  // Deposit amount in the underlying token and receive a quantity of LP tokens
+  // based on depositorRatio().
+  // The contract must have approval to transfer the given amount of the
+  // underlying token.
+  // lpTokenAmount is the amount of issued LP tokens.
+  function deposit(uint256 endpointId, uint256 amount) external returns (
+    uint256 lpTokenAmount
+  ) {
+    endpoints[endpointId].token.transferFrom(msg.sender, address(this), amount);
+    endpoints[endpointId].token.approve(
+      address(endpoints[endpointId].endpoint), amount);
+    lpTokenAmount = (amount * (10 ** decimals)) / depositorRatio(endpointId);
+    endpoints[endpointId].lpToken.mint(msg.sender, lpTokenAmount);
+    endpoints[endpointId].endpoint.deposit(amount);
+    _setMinEndpointRatio(endpointId);
+    emit Deposited(
+      msg.sender,
+      endpointId,
+      amount,
+      lpTokenAmount
+    );
+  }
+
+  // Withdraw lpTokenAmount to receive a quantity of underlying tokens based
+  // on depositorRatio().
+  function withdraw(uint256 endpointId, uint256 lpTokenAmount) external returns (
+    uint256 depositorPay
+  ) {
+    uint256 endpointWithdrawAmount = (
+      lpTokenAmount * endpointRatio(endpointId)) / (10 ** decimals);
+    uint256 depositorToEndpointRatio = (
+      depositorRatio(endpointId) * (10 ** decimals)) / endpointRatio(endpointId);
+    endpointWithdrawAmount = endpoints[endpointId].endpoint.withdraw(
+      endpointWithdrawAmount);
+    depositorPay = (
+      depositorToEndpointRatio * endpointWithdrawAmount) / (10 ** decimals);
+    uint256 protocolFeeAmount = endpointWithdrawAmount - depositorPay;
+    endpoints[endpointId].token.transferFrom(
+      address(endpoints[endpointId].endpoint),
+      msg.sender,
+      depositorPay
+    );
+    endpoints[endpointId].lpToken.burn(msg.sender, lpTokenAmount);
+    endpoints[endpointId].token.transferFrom(
+      address(endpoints[endpointId].endpoint),
+      owner(),
+      protocolFeeAmount
+    );
+    _setMinEndpointRatio(endpointId);
+    emit Withdrawn(
+      msg.sender,
+      endpointId,
+      depositorPay,
+      lpTokenAmount
+    );
+  }
+
+  // How much of the underlying token 1 LP token is worth, i.e. the exchange
+  // rate.
+  function depositorRatio(uint256 endpointId) public view returns (uint256 amount) {
+    return endpointRatio(endpointId) - feeRatio(endpointId);
+  }
+
+  // How much of the underlying token = 1 LP token without factoring in fees
+  // (not the real exchange rate)
+  function endpointRatio(uint256 endpointId) public view returns (uint256 amount) {
+    uint256 totalSupply = endpoints[endpointId].lpToken.totalSupply();
+    if (totalSupply == 0) {
+      return (10 ** decimals);
+    } else {
+      return (endpoints[endpointId].endpoint.withdrawableAmount()
+              * (10 ** decimals)) / totalSupply;
+    }
+  }
+
+  // What is subtracted from endpointRatio() to produce the real exchange rate.
+  function feeRatio(uint256 endpointId) public view returns (uint256 amount) {
+    if (endpoints[endpointId].lpToken.totalSupply() == 0 || protocolFee == 0) {
+      return 0;
+    } else {
+      return (
+        (endpointRatio(endpointId) - endpoints[endpointId].minEndpointRatio)
+        * protocolFee) / (10 ** decimals);
+    }
+  }
+
+  function createLPToken(
+    string memory name,
+    string memory symbol,
+    address underlying,
+    uint8 _decimals
+  ) external returns (LPToken lpToken) {
+    lpToken = new LPToken(name, symbol, underlying, _decimals);
+    lpToken.transferOwnership(msg.sender);
+  }
+
+  // Add a new endpoint.
+  function addEndpoint(
+    IEndpoint endpoint,
+    string memory name,
+    string memory symbol,
+    IERC20 token
+  ) external returns (uint256 endpointId) {
+    Endpoint memory endpointRecord;
+    endpointRecord.endpoint = endpoint;
+
+    endpointRecord.lpToken = new LPToken(name, symbol, address(token), 0);
+    endpointRecord.token = token;
+    endpointRecord.name = name;
+    endpoints.push(endpointRecord);
+    endpointId = endpoints.length - 1;
+    endpoints[endpointId].minEndpointRatio = endpointRatio(endpointId);
+
+    emit EndpointAdded(
+      msg.sender,
+      endpointId,
+      name,
+      symbol,
+      address(token)
+    );
+  }
+
+  function verifyEndpoint(string memory name, uint256 endpointId) external onlyOwner {
+    endpoints[endpointId].verified = true;
+    verifiedEndpoints[name] = endpointId;
+  }
+
+  function unverifyEndpoint(string memory name) external onlyOwner {
+    uint256 endpointId = verifiedEndpoints[name];
+    delete verifiedEndpoints[name];
+    endpoints[endpointId].verified = false;
+  }
+
+  // This function must be called if the supply is updated.
+  function _setMinEndpointRatio(uint256 endpointId) internal {
+    uint256 currentRatio = endpointRatio(endpointId);
+    if (currentRatio < endpoints[endpointId].minEndpointRatio) {
+      endpoints[endpointId].minEndpointRatio = currentRatio;
+    }
+  }
+
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+abstract contract Swapper {
+  address protocol;
+
+  constructor(address _protocol) {
+    protocol = _protocol;
+  }
+
+  // Must be authorized.
+  // Swaps an ERC20 token for the native token and sends it back.
+  // amount is in requested tokens.
+  // spent is in ERC20 tokens
+  function swapToNative(
+    IERC20 token,
+    uint256 requestedAmount,
+    uint256 amountInMax
+  ) public virtual returns (uint256 spent) {}
+
+  function swap(
+    IERC20 token1,
+    IERC20 token2,
+    uint256 amountOutMin,
+    uint256 amountIn
+  ) public virtual returns (uint256 received) {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "../interfaces/ILayerZeroReceiver.sol";
+import "../interfaces/ILayerZeroUserApplicationConfig.sol";
+import "../interfaces/ILayerZeroEndpoint.sol";
+
+/*
+ * a generic LzReceiver implementation
+ */
+abstract contract LzApp is Ownable, ILayerZeroReceiver, ILayerZeroUserApplicationConfig {
+    ILayerZeroEndpoint public immutable lzEndpoint;
+
+    mapping(uint16 => bytes) public trustedRemoteLookup;
+
+    event SetTrustedRemote(uint16 _srcChainId, bytes _srcAddress);
+
+    constructor(address _endpoint) {
+        lzEndpoint = ILayerZeroEndpoint(_endpoint);
+    }
+
+    function lzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) public virtual override {
+        // lzReceive must be called by the endpoint for security
+        require(_msgSender() == address(lzEndpoint), "LzApp: invalid endpoint caller");
+
+        bytes memory trustedRemote = trustedRemoteLookup[_srcChainId];
+        // if will still block the message pathway from (srcChainId, srcAddress). should not receive message from untrusted remote.
+        require(_srcAddress.length == trustedRemote.length && keccak256(_srcAddress) == keccak256(trustedRemote), "LzApp: invalid source sending contract");
+
+        _blockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+    }
+
+    // abstract function - the default behaviour of LayerZero is blocking. See: NonblockingLzApp if you dont need to enforce ordered messaging
+    function _blockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual;
+
+    function _lzSend(uint16 _dstChainId, bytes memory _payload, address payable _refundAddress, address _zroPaymentAddress, bytes memory _adapterParams) internal virtual {
+        bytes memory trustedRemote = trustedRemoteLookup[_dstChainId];
+        require(trustedRemote.length != 0, "LzApp: destination chain is not a trusted source");
+        lzEndpoint.send{value: msg.value}(_dstChainId, trustedRemote, _payload, _refundAddress, _zroPaymentAddress, _adapterParams);
+    }
+
+    //---------------------------UserApplication config----------------------------------------
+    function getConfig(uint16 _version, uint16 _chainId, address, uint _configType) external view returns (bytes memory) {
+        return lzEndpoint.getConfig(_version, _chainId, address(this), _configType);
+    }
+
+    // generic config for LayerZero user Application
+    function setConfig(uint16 _version, uint16 _chainId, uint _configType, bytes calldata _config) external override onlyOwner {
+        lzEndpoint.setConfig(_version, _chainId, _configType, _config);
+    }
+
+    function setSendVersion(uint16 _version) external override onlyOwner {
+        lzEndpoint.setSendVersion(_version);
+    }
+
+    function setReceiveVersion(uint16 _version) external override onlyOwner {
+        lzEndpoint.setReceiveVersion(_version);
+    }
+
+    function forceResumeReceive(uint16 _srcChainId, bytes calldata _srcAddress) external override onlyOwner {
+        lzEndpoint.forceResumeReceive(_srcChainId, _srcAddress);
+    }
+
+    function setTrustedRemote(uint16 _srcChainId, bytes memory _srcAddress) internal {
+        trustedRemoteLookup[_srcChainId] = _srcAddress;
+        emit SetTrustedRemote(_srcChainId, _srcAddress);
+    }
+
+    //--------------------------- VIEW FUNCTION ----------------------------------------
+
+    function isTrustedRemote(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (bool) {
+        bytes memory trustedSource = trustedRemoteLookup[_srcChainId];
+        return keccak256(trustedSource) == keccak256(_srcAddress);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.13;
+
+interface ILayerZeroReceiver {
+    // @notice LayerZero endpoint will invoke this function to deliver the message on the destination
+    // @param _srcChainId - the source endpoint identifier
+    // @param _srcAddress - the source sending contract address from the source chain
+    // @param _nonce - the ordered message nonce
+    // @param _payload - the signed payload is the UA bytes has encoded to be sent
+    function lzReceive(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) external;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IERC20Detailed is IERC20 {
+  function decimals() external view returns (uint8);
+}
