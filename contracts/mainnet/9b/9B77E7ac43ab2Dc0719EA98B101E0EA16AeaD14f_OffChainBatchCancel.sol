@@ -1,0 +1,1244 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.12;
+import "./interfaces/ArrayUtils_v8.sol";
+import "../tools/SecurityBaseFor8.sol";
+import "./CancelOrder.sol";
+import "./interfaces/ICancelOrder_v8.sol";
+
+interface IOffChainBatchCancel {
+    struct Order {
+        /* Exchange address, intended as a versioning mechanism. */
+        address exchange;
+        /* Order maker address. */
+        address maker;
+        /* Order taker address, if specified. */
+        address taker;
+        /* Maker relayer fee of the order, unused for taker order. */
+        uint256 makerRelayerFee;
+        /* Taker relayer fee of the order, or maximum taker fee for a taker order. */
+        uint256 takerRelayerFee;
+        /* Maker protocol fee of the order, unused for taker order. */
+        uint256 makerProtocolFee;
+        /* Taker protocol fee of the order, or maximum taker fee for a taker order. */
+        uint256 takerProtocolFee;
+        /* Order fee recipient or zero address for taker order. */
+        address feeRecipient;
+        /* Fee method (protocol token or split fee). */
+        FeeMethod feeMethod;
+        /* Side (buy/sell). */
+        Side side;
+        /* Kind of sale. */
+        SaleKind saleKind;
+        /* Target. */
+        address target;
+        /* HowToCall. */
+        HowToCall howToCall;
+        /* Calldata. */
+        bytes calldataInfo;
+        /* Calldata replacement pattern, or an empty byte array for no replacement. */
+        bytes replacementPattern;
+        /* Static call target, zero-address for no static call. */
+        address staticTarget;
+        /* Static call extra data. */
+        bytes staticExtradata;
+        /* Token used to pay for the order, or the zero-address as a sentinel value for Ether. */
+        address paymentToken;
+        /* Base price of the order (in paymentTokens). */
+        uint256 basePrice;
+        /* Auction extra parameter - minimum bid increment for English auctions, starting/ending price difference. */
+        uint256 extra;
+        /* Listing timestamp. */
+        uint256 listingTime;
+        /* Expiration timestamp - 0 for no expiry. */
+        uint256 expirationTime;
+        /* Order salt, used to prevent duplicate hashes. */
+        uint256 salt;
+    }
+
+    struct Sig {
+        /* v parameter */   
+        uint8 v;
+        /* r parameter */
+        bytes32 r;
+        /* s parameter */
+        bytes32 s;
+    }
+
+    enum FeeMethod {
+        ProtocolFee,
+        SplitFee
+    }
+    enum HowToCall { Call, DelegateCall }
+
+    enum SaleKind { FixedPrice, DutchAuction }
+    enum Side { Buy, Sell }
+    function cancelOrder(Order memory order, Sig memory sig) external;
+
+}
+contract OffChainBatchCancel is SecurityBaseFor8,IOffChainBatchCancel{
+
+    event OrderCancelled(bytes32 indexed hash);
+    event OrderApprovedPartOne(
+        bytes32 indexed hash,
+        address exchange,
+        address indexed maker,
+        address taker,
+        uint256 makerRelayerFee,
+        uint256 takerRelayerFee,
+        uint256 makerProtocolFee,
+        uint256 takerProtocolFee,
+        address indexed feeRecipient,
+        FeeMethod feeMethod,
+        Side side,
+        SaleKind saleKind,
+        address target
+    );
+    event OrderApprovedPartTwo(
+        bytes32 indexed hash,
+        HowToCall howToCall,
+        bytes calldataInfo,
+        bytes replacementPattern,
+        address staticTarget,
+        bytes staticExtradata,
+        address paymentToken,
+        uint256 basePrice,
+        uint256 extra,
+        uint256 listingTime,
+        uint256 expirationTime,
+        uint256 salt,
+        bool orderbookInclusionDesired
+    );
+    /* For split fee orders, minimum required protocol maker fee, in basis points. Paid to owner (who can change it). */
+    address public offChainExchangeAddress;
+    CancelOrder public cancelOrderAddr;
+
+    function setupExchangeAddress (address _offChainExchangeAddress) external onlyOwner{
+        offChainExchangeAddress = _offChainExchangeAddress;
+    }
+
+    function setupCancelOrder(CancelOrder _cancelOrderAddr)
+    external
+    onlyOwner
+    {
+        cancelOrderAddr = _cancelOrderAddr;
+    }  
+
+    /**
+     * @dev Approve an order and optionally mark it for orderbook inclusion. Must be called by the maker of the order
+     * @param order Order to approve
+     * @param orderbookInclusionDesired Whether orderbook providers should include the order in their orderbooks
+     */
+    function approveOrder(Order memory order, bool orderbookInclusionDesired)
+        internal
+    {
+        /* CHECKS */
+
+        /* Assert sender is authorized to approve order. */
+        require(msg.sender == order.maker);
+
+        /* Calculate order hash. */
+        bytes32 hash = hashToSign(order);
+
+        /* Assert order has not already been approved. */
+        require(!cancelOrderAddr.getOrderApprovedStatus(hash));
+
+        /* EFFECTS */
+
+        /* Mark order as approved. */
+        cancelOrderAddr.setOrderApproved(hash);
+
+        /* Log approval event. Must be split in two due to Solidity stack size limitations. */
+        {
+            emit OrderApprovedPartOne(
+                hash,
+                order.exchange,
+                order.maker,
+                order.taker,
+                order.makerRelayerFee,
+                order.takerRelayerFee,
+                order.makerProtocolFee,
+                order.takerProtocolFee,
+                order.feeRecipient,
+                order.feeMethod,
+                order.side,
+                order.saleKind,
+                order.target
+            );
+        }
+        {
+            emit OrderApprovedPartTwo(
+                hash,
+                order.howToCall,
+                order.calldataInfo,
+                order.replacementPattern,
+                order.staticTarget,
+                order.staticExtradata,
+                order.paymentToken,
+                order.basePrice,
+                order.extra,
+                order.listingTime,
+                order.expirationTime,
+                order.salt,
+                orderbookInclusionDesired
+            );
+        }
+    }
+
+       /**
+     * @dev Call approveOrder - Solidity ABI encoding limitation workaround, hopefully temporary.
+     */
+    function approveOrder_(
+        address[7] memory addrs,
+        uint256[9] memory uints,
+        FeeMethod feeMethod,
+        Side side,
+        SaleKind saleKind,
+        HowToCall howToCall,
+        bytes memory calldataInfo,
+        bytes memory replacementPattern,
+        bytes memory staticExtradata,
+        bool orderbookInclusionDesired
+    ) public {
+        Order memory order = Order(
+            addrs[0],
+            addrs[1],
+            addrs[2],
+            uints[0],
+            uints[1],
+            uints[2],
+            uints[3],
+            addrs[3],
+            feeMethod,
+            side,
+            saleKind,
+            addrs[4],
+            howToCall,
+            calldataInfo,
+            replacementPattern,
+            addrs[5],
+            staticExtradata,
+            addrs[6],
+            uints[4],
+            uints[5],
+            uints[6],
+            uints[7],
+            uints[8]
+        );
+        return approveOrder(order, orderbookInclusionDesired);
+    }
+
+    function requireValidOrder(Order memory order, Sig memory sig)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 hash = hashToSign(order);
+        require(validateOrder(hash, order, sig));
+        return hash;
+    }
+
+    function hashToSign(Order memory order) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hashOrder(order)));
+    }
+
+    function hashOrder(Order memory order)
+        internal
+        pure
+        returns (bytes32 hash)
+    {
+        /* Unfortunately abi.encodePacked doesn't work here, stack size constraints. */
+        uint256 size = sizeOf(order);
+        bytes memory array = new bytes(size);
+        uint256 index;
+        assembly {
+            index := add(array, 0x20)
+        }
+        index = ArrayUtils.unsafeWriteAddress(index, order.exchange);
+        index = ArrayUtils.unsafeWriteAddress(index, order.maker);
+        index = ArrayUtils.unsafeWriteAddress(index, order.taker);
+        index = ArrayUtils.unsafeWriteUint(index, order.makerRelayerFee);
+        index = ArrayUtils.unsafeWriteUint(index, order.takerRelayerFee);
+        index = ArrayUtils.unsafeWriteUint(index, order.makerProtocolFee);
+        index = ArrayUtils.unsafeWriteUint(index, order.takerProtocolFee);
+        index = ArrayUtils.unsafeWriteAddress(index, order.feeRecipient);
+        index = ArrayUtils.unsafeWriteUint8(index, uint8(order.feeMethod));
+        index = ArrayUtils.unsafeWriteUint8(index, uint8(order.side));
+        index = ArrayUtils.unsafeWriteUint8(index, uint8(order.saleKind));
+        index = ArrayUtils.unsafeWriteAddress(index, order.target);
+        index = ArrayUtils.unsafeWriteUint8(index, uint8(order.howToCall));
+        index = ArrayUtils.unsafeWriteBytes(index, order.calldataInfo);
+        index = ArrayUtils.unsafeWriteBytes(index, order.replacementPattern);
+        index = ArrayUtils.unsafeWriteAddress(index, order.staticTarget);
+        index = ArrayUtils.unsafeWriteBytes(index, order.staticExtradata);
+        index = ArrayUtils.unsafeWriteAddress(index, order.paymentToken);
+        index = ArrayUtils.unsafeWriteUint(index, order.basePrice);
+        index = ArrayUtils.unsafeWriteUint(index, order.extra);
+        index = ArrayUtils.unsafeWriteUint(index, order.listingTime);
+        index = ArrayUtils.unsafeWriteUint(index, order.expirationTime);
+        index = ArrayUtils.unsafeWriteUint(index, order.salt);
+        assembly {
+            hash := keccak256(add(array, 0x20), size)
+        }
+        return hash;
+    }
+
+    /**
+     * Calculate size of an order struct when tightly packed
+     *
+     * @param order Order to calculate size of
+     * @return Size in bytes
+     */
+    function sizeOf(Order memory order) internal pure returns (uint256) {
+        return ((0x14 * 7) +
+            (0x20 * 9) +
+            4 +
+            order.calldataInfo.length +
+            order.replacementPattern.length +
+            order.staticExtradata.length);
+    }
+
+    function validateOrder(
+        bytes32 hash,
+        Order memory order,
+        Sig memory sig
+    ) internal view returns (bool) {
+        /* Not done in an if-conditional to prevent unnecessary ecrecover evaluation, which seems to happen even though it should short-circuit. */
+
+        /* Order must have valid parameters. */
+        if (!validateOrderParameters(order)) {
+            return false;
+        }
+
+        /* Order must have not been canceled or already filled. */
+        if (cancelOrderAddr.getOrderStatus(hash)) {
+            return false;
+        }
+        /* Order authentication. Order must be either:
+        /* (a) previously approved */
+        if (cancelOrderAddr.getOrderApprovedStatus(hash)) {
+            return true;
+        }
+
+        /* or (b) ECDSA-signed by maker. */
+        if (ecrecover(hash, sig.v, sig.r, sig.s) == order.maker) {
+            return true;
+        }
+
+        return false;
+    }
+    function hashToSign_(Order memory order) public pure returns (bytes32) {
+        return(hashToSign(order));
+    }
+    function validateOrderParameters(Order memory order)
+        internal
+        view
+        returns (bool)
+    {
+        /* Order must be targeted at this protocol version (this Exchange contract). */
+        if (order.exchange != offChainExchangeAddress) {
+            return false;
+        }
+
+        /* Order must possess valid sale kind parameter combination. */
+        if (
+            !validateParameters(
+                order.saleKind,
+                order.expirationTime
+            )
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @dev Check whether the parameters of a sale are valid
+     * @param saleKind Kind of sale
+     * @param expirationTime Order expiration time
+     * @return Whether the parameters were valid
+     */
+    function validateParameters(SaleKind saleKind, uint expirationTime)
+        pure
+        internal
+        returns (bool)
+    {
+        /* Auctions must have a set expiration date. */
+        return (saleKind == SaleKind.FixedPrice || expirationTime > 0);
+    }
+    
+   function cancelOrder(Order memory order, Sig memory sig) public  {
+        /* CHECKS */
+        /* Calculate order hash. */
+        bytes32 hash = requireValidOrder(order, sig);
+        /* Assert sender is authorized to cancel order. */
+
+        require(msg.sender == order.maker);
+        /* EFFECTS */
+
+        /* Mark order as cancelled, preventing it from being matched. */
+        cancelOrderAddr.setOrderStatusCanceled(hash);
+        /* Log cancel event. */
+        emit OrderCancelled(hash);    
+    }
+
+    function batchCancelOrders(Order[] memory orders, Sig[] memory sigs) external {      
+        bytes4 Selector = IOffChainBatchCancel.cancelOrder.selector;  
+        for (uint i =0; i < orders.length; i++ ) {
+            address(this).delegatecall(abi.encodeWithSelector(Selector, orders[i],sigs[i]));
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.12;
+
+library ArrayUtils {
+
+
+    function guardedArrayReplace(bytes memory array, bytes memory desired, bytes memory mask)
+    internal
+    pure
+    {
+        require(array.length == desired.length);
+        require(array.length == mask.length);
+
+        uint words = array.length / 0x20;
+        uint index = words * 0x20;
+        assert(index / 0x20 == words);
+        uint i;
+
+        for (i = 0; i < words; i++) {
+            /* Conceptually: array[i] = (!mask[i] && array[i]) || (mask[i] && desired[i]), bitwise in word chunks. */
+            assembly {
+                let commonIndex := mul(0x20, add(1, i))
+                let maskValue := mload(add(mask, commonIndex))
+                mstore(add(array, commonIndex), or(and(not(maskValue), mload(add(array, commonIndex))), and(maskValue, mload(add(desired, commonIndex)))))
+            }
+        }
+
+        /* Deal with the last section of the byte array. */
+        if (words > 0) {
+            /* This overlaps with bytes already set but is still more efficient than iterating through each of the remaining bytes individually. */
+            i = words;
+            assembly {
+                let commonIndex := mul(0x20, add(1, i))
+                let maskValue := mload(add(mask, commonIndex))
+                mstore(add(array, commonIndex), or(and(not(maskValue), mload(add(array, commonIndex))), and(maskValue, mload(add(desired, commonIndex)))))
+            }
+        } else {
+            /* If the byte array is shorter than a word, we must unfortunately do the whole thing bytewise.
+               (bounds checks could still probably be optimized away in assembly, but this is a rare case) */
+            for (i = index; i < array.length; i++) {
+                array[i] = ((mask[i] ^ 0xff) & array[i]) | (mask[i] & desired[i]);
+            }
+        }
+    }
+
+    /**
+     * Test if two arrays are equal
+     * Source: https://github.com/GNSPS/solidity-bytes-utils/blob/master/contracts/BytesLib.sol
+     *
+     * @dev Arrays must be of equal length, otherwise will return false
+     * @param a First array
+     * @param b Second array
+     * @return Whether or not all bytes in the arrays are equal
+     */
+    function arrayEq(bytes memory a, bytes memory b)
+    internal
+    pure
+    returns (bool)
+    {
+        bool success = true;
+
+        assembly {
+            let length := mload(a)
+
+        // if lengths don't match the arrays are not equal
+            switch eq(length, mload(b))
+            case 1 {
+            // cb is a circuit breaker in the for loop since there's
+            //  no said feature for inline assembly loops
+            // cb = 1 - don't breaker
+            // cb = 0 - break
+                let cb := 1
+
+                let mc := add(a, 0x20)
+                let end := add(mc, length)
+
+                for {
+                    let cc := add(b, 0x20)
+                // the next line is the loop condition:
+                // while(uint(mc < end) + cb == 2)
+                } eq(add(lt(mc, end), cb), 2) {
+                    mc := add(mc, 0x20)
+                    cc := add(cc, 0x20)
+                } {
+                // if any of these checks fails then arrays are not equal
+                    if iszero(eq(mload(mc), mload(cc))) {
+                    // unsuccess:
+                        success := 0
+                        cb := 0
+                    }
+                }
+            }
+            default {
+            // unsuccess:
+                success := 0
+            }
+        }
+
+        return success;
+    }
+
+    /**
+     * Unsafe write byte array into a memory location
+     *
+     * @param index Memory location
+     * @param source Byte array to write
+     * @return End memory index
+     */
+    function unsafeWriteBytes(uint index, bytes memory source)
+    internal
+    pure
+    returns (uint)
+    {
+        if (source.length > 0) {
+            assembly {
+                let length := mload(source)
+                let end := add(source, add(0x20, length))
+                let arrIndex := add(source, 0x20)
+                let tempIndex := index
+                for { } eq(lt(arrIndex, end), 1) {
+                    arrIndex := add(arrIndex, 0x20)
+                    tempIndex := add(tempIndex, 0x20)
+                } {
+                    mstore(tempIndex, mload(arrIndex))
+                }
+                index := add(index, length)
+            }
+        }
+        return index;
+    }
+
+    /**
+     * Unsafe write address into a memory location
+     *
+     * @param index Memory location
+     * @param source Address to write
+     * @return End memory index
+     */
+    function unsafeWriteAddress(uint index, address source)
+    internal
+    pure
+    returns (uint)
+    {
+        uint conv = uint256(uint160(source)) << 0x60;
+        assembly {
+            mstore(index, conv)
+            index := add(index, 0x14)
+        }
+        return index;
+    }
+
+    /**
+     * Unsafe write uint into a memory location
+     *
+     * @param index Memory location
+     * @param source uint to write
+     * @return End memory index
+     */
+    function unsafeWriteUint(uint index, uint source)
+    internal
+    pure
+    returns (uint)
+    {
+        assembly {
+            mstore(index, source)
+            index := add(index, 0x20)
+        }
+        return index;
+    }
+
+    /**
+     * Unsafe write uint8 into a memory location
+     *
+     * @param index Memory location
+     * @param source uint8 to write
+     * @return End memory index
+     */
+    function unsafeWriteUint8(uint index, uint8 source)
+    internal
+    pure
+    returns (uint)
+    {
+        assembly {
+            mstore8(index, source)
+            index := add(index, 0x1)
+        }
+        return index;
+    }
+
+}
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @dev Main functions:
+ */
+abstract contract SecurityBaseFor8 is Ownable {
+
+    using SafeERC20 for IERC20;
+    using Address for address payable;
+    using Address for address;
+
+    event EmergencyWithdraw(address token, address to, uint256 amount);
+    event SetWhitelist(address account, bool knob);
+
+    // whitelist
+    mapping(address => bool) public whitelist;
+
+    constructor() {}
+
+    modifier onlyWhitelist() {
+        require(whitelist[msg.sender], "SecurityBase::onlyWhitelist: isn't in the whitelist");
+        _;
+    }
+
+    function setWhitelist(address account, bool knob) external onlyOwner {
+        whitelist[account] = knob;
+        emit SetWhitelist(account, knob);
+    }
+
+    function withdraw(address token, address to, uint256 amount) external onlyOwner {
+        if (token.isContract()) {
+            IERC20(token).safeTransfer(to, amount);
+        } else {
+            payable(to).sendValue(amount);
+        }
+        emit EmergencyWithdraw(token, to, amount);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.12;
+import "./interfaces/ArrayUtils_v8.sol";
+import "./interfaces/ICancelOrder_v8.sol";
+import "../tools/SecurityBaseFor8.sol";
+
+contract CancelOrder is ICancelOrder_v8,SecurityBaseFor8 {
+     /**
+     * @dev Batch cancel ordesr, preventing it from being matched. Must be called by the maker of the order
+     * @param orders Orders to cancel
+     * @param sigs ECDSA signature
+     */
+    struct OrderStatus {
+        bool cancelledOrFinalized;
+    }
+    // Track status of each order (validated, cancelled, and fraction filled).
+    mapping(bytes32 => OrderStatus) private _orderStatus;
+    /* Orders verified by on-chain approval (alternative to ECDSA signatures so that smart contracts can place orders directly). */
+    mapping(bytes32 => bool) private _approvedOrders;
+    
+    mapping(address => bool) public allowedAddress;
+
+    function setAllowedAddr(address _addr) external onlyOwner {
+        allowedAddress[_addr] = true;
+    }
+
+    function setOrderStatusCanceled(bytes32 hash) public {
+        require(allowedAddress[msg.sender], "Access restricted");
+        _orderStatus[hash].cancelledOrFinalized = true;
+    }
+
+    function setOrderApproved(bytes32 hash) public {
+        require(allowedAddress[msg.sender], "Access restricted");
+        _approvedOrders[hash] = true;
+    }
+
+    function getOrderApprovedStatus(bytes32 hash) public view returns (bool) {
+        return _approvedOrders[hash];
+    }
+
+    function getOrderStatus(bytes32 hash) public view returns (bool) {
+        return _orderStatus[hash].cancelledOrFinalized;
+    }
+}
+
+pragma solidity 0.8.12;
+
+interface ICancelOrder_v8 {
+    struct Order {
+        /* Exchange address, intended as a versioning mechanism. */
+        address exchange;
+        /* Order maker address. */
+        address maker;
+        /* Order taker address, if specified. */
+        address taker;
+        /* Maker relayer fee of the order, unused for taker order. */
+        uint256 makerRelayerFee;
+        /* Taker relayer fee of the order, or maximum taker fee for a taker order. */
+        uint256 takerRelayerFee;
+        /* Maker protocol fee of the order, unused for taker order. */
+        uint256 makerProtocolFee;
+        /* Taker protocol fee of the order, or maximum taker fee for a taker order. */
+        uint256 takerProtocolFee;
+        /* Order fee recipient or zero address for taker order. */
+        address feeRecipient;
+        /* Fee method (protocol token or split fee). */
+        FeeMethod feeMethod;
+        /* Side (buy/sell). */
+        Side side;
+        /* Kind of sale. */
+        SaleKind saleKind;
+        /* Target. */
+        address target;
+        /* HowToCall. */
+        HowToCall howToCall;
+        /* Calldata. */
+        bytes calldataInfo;
+        /* Calldata replacement pattern, or an empty byte array for no replacement. */
+        bytes replacementPattern;
+        /* Static call target, zero-address for no static call. */
+        address staticTarget;
+        /* Static call extra data. */
+        bytes staticExtradata;
+        /* Token used to pay for the order, or the zero-address as a sentinel value for Ether. */
+        address paymentToken;
+        /* Base price of the order (in paymentTokens). */
+        uint256 basePrice;
+        /* Auction extra parameter - minimum bid increment for English auctions, starting/ending price difference. */
+        uint256 extra;
+        /* Listing timestamp. */
+        uint256 listingTime;
+        /* Expiration timestamp - 0 for no expiry. */
+        uint256 expirationTime;
+        /* Order salt, used to prevent duplicate hashes. */
+        uint256 salt;
+    }
+
+    struct Sig {
+        /* v parameter */   
+        uint8 v;
+        /* r parameter */
+        bytes32 r;
+        /* s parameter */
+        bytes32 s;
+    }
+    enum FeeMethod {
+        ProtocolFee,
+        SplitFee
+    }
+    enum HowToCall { Call, DelegateCall }
+
+    enum SaleKind { FixedPrice, DutchAuction }
+    enum Side { Buy, Sell }
+    
+    function getOrderStatus(bytes32 _hash) external view returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Address.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize, which returns 0 for contracts in
+        // construction, since the code is only stored at the end of the
+        // constructor execution.
+
+        uint256 size;
+        assembly {
+            size := extcodesize(account)
+        }
+        return size > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCall(target, data, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        require(isContract(target), "Address: call to non-contract");
+
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        require(isContract(target), "Address: static call to non-contract");
+
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(isContract(target), "Address: delegate call to non-contract");
+
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            // Look for revert reason and bubble it up if present
+            if (returndata.length > 0) {
+                // The easiest way to bubble the revert reason is using memory via assembly
+
+                assembly {
+                    let returndata_size := mload(returndata)
+                    revert(add(32, returndata), returndata_size)
+                }
+            } else {
+                revert(errorMessage);
+            }
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 newAllowance = token.allowance(address(this), spender) + value;
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+    }
+
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            uint256 newAllowance = oldAllowance - value;
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+        }
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address.functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `recipient`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `sender` to `recipient` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
