@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+interface TOKEN {
+    function decimals() external view returns(uint8);
+    function balanceOf(address account) external view returns(uint256);
+    function transfer(address recipient, uint256 amount) external returns(bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns(bool);
+
+    // only for OMHERC20 token
+    function isExcludedFromBurn(address user) external view returns(bool);
+}
+
+contract StakingAlgo1 is ReentrancyGuard {
+    struct UserInfo {
+        uint256 depositedAmount; // total deposited amount for this user
+        uint256 lockedTime; // locked period for claim of this user, ex: 1 year, 3 year
+        uint256 rewardPayouts;
+        // ALA is the abbreviation for At the time of the Latest Action
+        uint256 totalRewardALA; // total reward amount at the time of the latest action like deposit, claim
+    }
+
+    uint256 public startDate;
+    uint256 public totalDeposit; // total deposited amount (user deposit)
+    uint256 public totalReward; // total reward amount (admin)
+    uint256 public latestReward;
+    // TODO: need to set rewardpercent (vip1RewardPercent, ) logic again
+    uint256 public vip1MinAmount = 100000; // $100000
+    uint256 public vip1LockingPeriod = 60 * 60 * 24 * 365; // 1 year
+    uint256 public vip1RewardPercent = 85; // 85% of totalReward
+    uint256 public vip2MinAmount = 1000000; // $1000000
+    uint256 public vip2LockingPeriod = 60 * 60 * 24 * 365 * 3; // 3 year
+    uint256 public vip2RewardPercent = 100; // 100% of totalReward
+    uint256 public rewardPercent = 70; // 70% of totalReward
+
+    // TODO: check
+    uint256 public minDepositAmount = 100; // $100
+
+    uint256 public depositFeePc = 50; // 5%
+    uint256 public depositFeePcForVip1 = 25; // 2.5%
+    // TODO: withdraw fee?
+    // uint256 public withdrawFeePercent = 5;
+
+    uint256 public rewardCycle = 7; // 7 days
+    uint256 public constant APYDENOMINATOR = 100000000;
+    uint256 public constant DENOMINATOR = 1000;
+    uint256 private constant USD = 10**8; // usd decimals is 8
+
+    bool public pause = false;
+
+    address public admin;
+
+    TOKEN public depositToken;
+    TOKEN public rewardToken; // OMH token
+
+    mapping(address => UserInfo) private userInfo;
+
+    event Deposit(
+        address indexed caller,
+        uint256 inputDepositAmount,
+        uint256 fee,
+        uint256 createdAt
+    );
+
+    // TODO: withdraw fee?
+    event Withdraw(
+        address indexed caller,
+        uint256 withdrawAmount,
+        uint256 rewardAmount,
+        uint256 createdAt
+    );
+
+    event Claim(address indexed caller, uint256 claimAmount, uint256 createdAt);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "caller is not admin");
+        _;
+    }
+
+    modifier checkActive() {
+        require(block.timestamp >= startDate && !pause, "can not do now");
+        _;
+    }
+
+    // USD stable coin - OMH pool
+    // usdc-omh, usdt-omh, dai-omh, miMATIC-omh, etc
+    constructor(
+        uint256 _startDate,
+        address _depositToken,
+        address _rewardToken
+    ) {
+        require(
+            _depositToken != address(0) && _rewardToken != address(0),
+            "invalid address"
+        );
+        admin = msg.sender;
+        startDate = _startDate;
+        depositToken = TOKEN(_depositToken);
+        rewardToken = TOKEN(_rewardToken); // OMH token
+    }
+
+    /** only admin functions */
+    function changeAdmin(address _new) external onlyAdmin {
+        require(_new != address(0), "invalid address");
+        admin = _new;
+    }
+
+    function changeDepositToken(address _newToken) external onlyAdmin {
+        depositToken = TOKEN(_newToken);
+    }
+
+    function changeRewardToken(address _newToken) external onlyAdmin {
+        rewardToken = TOKEN(_newToken);
+    }
+
+    function changeStartDate(uint256 _newDate) external onlyAdmin {
+        startDate = _newDate;
+    }
+
+    // TODO: withdraw fee?
+    function changeDepositFeePc(uint256 _feePc, uint256 _vip1FeePc)
+        external
+        onlyAdmin
+    {
+        depositFeePc = _feePc;
+        depositFeePcForVip1 = _vip1FeePc;
+    }
+
+    function changeVip1(uint256 _minAmount, uint256 _lockingPeriod)
+        external
+        onlyAdmin
+    {
+        vip1MinAmount = _minAmount;
+        vip1LockingPeriod = _lockingPeriod;
+    }
+
+    function changeVip2(uint256 _minAmount, uint256 _lockingPeriod)
+        external
+        onlyAdmin
+    {
+        vip2MinAmount = _minAmount;
+        vip2LockingPeriod = _lockingPeriod;
+    }
+
+    function changeMinDepositAmount(uint256 _newAmount) external onlyAdmin {
+        minDepositAmount = _newAmount;
+    }
+
+    function changeRewardCycle(uint256 _days) external onlyAdmin {
+        require(_days > 0);
+        rewardCycle = _days;
+    }
+
+    function setRewardPercent(
+        uint256 _regularPercent,
+        uint256 _vip1Percent,
+        uint256 _vip2Percent
+    ) external onlyAdmin {
+        rewardPercent = _regularPercent;
+        vip1RewardPercent = _vip1Percent;
+        vip2RewardPercent = _vip2Percent;
+    }
+
+    function setPause(bool _status) external onlyAdmin {
+        pause = _status;
+    }
+
+    function allTokenWithdraw() external onlyAdmin {
+        pause = true;
+        totalDeposit = 0;
+        totalReward = 0;
+        uint256 _depositTokenAmount = depositToken.balanceOf(address(this));
+        depositToken.transfer(admin, _depositTokenAmount);
+        uint256 _rewardTokenAmount = rewardToken.balanceOf(address(this));
+        rewardToken.transfer(admin, _rewardTokenAmount);
+    }
+
+    function addReward(uint256 _amount) external onlyAdmin {
+        rewardToken.transferFrom(msg.sender, address(this), _amount);
+        uint256 _burnAmount = 0;
+        bool _isExcludedAddress = rewardToken.isExcludedFromBurn(msg.sender);
+        if (msg.sender.code.length == 0 && !_isExcludedAddress) {
+           _burnAmount = (_amount * 2) / 100; // OMH 2% burn
+        }
+        uint256 _newAmount = _amount - _burnAmount;
+        totalReward += _newAmount;
+        latestReward = _newAmount;
+    }
+
+    /** external funtions */
+    function deposit(uint256 _amount) external checkActive {
+        uint256 _decimals = depositTokenDecimals();
+        require(
+            _amount / (10**_decimals) >= minDepositAmount,
+            "amount is less than min deposit amount"
+        );
+        uint256 _timeNow = block.timestamp;
+
+        depositToken.transferFrom(msg.sender, address(this), _amount);
+
+        uint256 _vip1MinAmount = vip1MinAmount * (10**_decimals);
+        uint256 _vip2MinAmount = vip2MinAmount * (10**_decimals);
+        uint256 _totalReward = totalReward;
+        // set new available reward amount before deposit
+        {
+            uint256 _depositedAmount = userInfo[msg.sender].depositedAmount;
+
+            uint256 _newReward = _totalReward -
+                userInfo[msg.sender].totalRewardALA;
+            uint256 _rewardAmount = userInfo[msg.sender].rewardPayouts;
+            if (_newReward > 0) {
+                uint256 _rewardPercent = _depositedAmount >= _vip2MinAmount
+                    ? vip2RewardPercent
+                    : _depositedAmount >= _vip1MinAmount
+                    ? vip1RewardPercent
+                    : rewardPercent;
+
+                _rewardAmount += (_newReward * _rewardPercent * _depositedAmount) / totalDeposit / 100;
+            }
+
+            userInfo[msg.sender].rewardPayouts = _rewardAmount;
+        }
+
+        // deposit fee
+        uint256 _fee = 0;
+        if (_amount < _vip1MinAmount) {
+            _fee = (_amount * depositFeePc) / DENOMINATOR;
+        } else if (_amount < _vip2MinAmount) {
+            _fee = (_amount * depositFeePcForVip1) / DENOMINATOR;
+        }
+
+        if (_fee > 0) {
+            // send fee to admin
+            depositToken.transfer(admin, _fee);
+        }
+
+        uint256 _actualAmount = _amount - _fee;
+        totalDeposit += _actualAmount;
+
+        uint256 _totalDepositedAmount = userInfo[msg.sender].depositedAmount +
+            _actualAmount;
+        userInfo[msg.sender].depositedAmount = _totalDepositedAmount;
+        userInfo[msg.sender].totalRewardALA = _totalReward;
+
+        if (_totalDepositedAmount >= _vip2MinAmount) {
+            userInfo[msg.sender].lockedTime = _timeNow + vip2LockingPeriod;
+        } else if (_totalDepositedAmount >= _vip1MinAmount) {
+            userInfo[msg.sender].lockedTime = _timeNow + vip1LockingPeriod;
+        } else {
+            userInfo[msg.sender].lockedTime = _timeNow;
+        }
+
+        emit Deposit(msg.sender, _actualAmount, _fee, _timeNow);
+    }
+
+    function withdraw() external nonReentrant checkActive {
+        uint256 _withdrawAmount = userInfo[msg.sender].depositedAmount;
+        require(_withdrawAmount > 0, "not depositor");
+        require(block.timestamp > userInfo[msg.sender].lockedTime, "locked");
+
+        uint256 _reward = getRewardAmount(msg.sender);
+
+        totalDeposit -= _withdrawAmount;
+        userInfo[msg.sender] = UserInfo({
+            depositedAmount: 0,
+            lockedTime: 0,
+            rewardPayouts: 0,
+            totalRewardALA: 0
+        });
+
+        // TODO: withdraw fee?
+        depositToken.transfer(msg.sender, _withdrawAmount);
+        if (_reward > 0) {
+            rewardToken.transfer(msg.sender, _reward);
+        }
+
+        emit Withdraw(msg.sender, _withdrawAmount, _reward, block.timestamp);
+    }
+
+    function claim() external nonReentrant checkActive {
+        uint256 _reward = getRewardAmount(msg.sender);
+        require(_reward > 0, "no reward");
+
+        userInfo[msg.sender].rewardPayouts = 0;
+        userInfo[msg.sender].totalRewardALA = totalReward;
+
+        rewardToken.transfer(msg.sender, _reward);
+
+        emit Claim(msg.sender, _reward, block.timestamp);
+    }
+
+    /** view functions */
+    function getWithdrawAmount(address _user) external view returns (uint256) {
+        return userInfo[_user].depositedAmount;
+    }
+
+    function getRewardAmount(address _user) public view returns (uint256) {
+        require(_user != address(0), "invalid address");
+
+        uint256 _depositedAmount = userInfo[_user].depositedAmount;
+        require(_depositedAmount > 0, "not depositor");
+
+        uint256 _newReward = totalReward -
+            userInfo[_user].totalRewardALA;
+        uint256 _rewardAmount = userInfo[_user].rewardPayouts;
+        uint256 _decimals = depositTokenDecimals();
+        if (_newReward > 0) {
+            uint256 _rewardPercent = _depositedAmount / 10**_decimals >= vip2MinAmount
+                ? vip2RewardPercent
+                : _depositedAmount / 10**_decimals >= vip1MinAmount
+                ? vip1RewardPercent
+                : rewardPercent;
+
+            _rewardAmount += (_newReward * _rewardPercent * _depositedAmount) / totalDeposit / 100;
+        }
+
+        return _rewardAmount;
+    }
+
+    function apyNotVip() external view returns (uint256) {
+        /**
+         * totalDeposit - total deposited amount
+         * APYDENOMINATOR - decimal places, default is 6: 100000000
+         * 365 - days of 1 year
+         * rewardPercent - user(not vip)'s reward percent, default is 70% of totalReward
+         * latestReward - latest reward amount set by the admin
+         * rewardCycle - cycle of reward, default is 7 days
+         * 100 - denominator (% of rewardPercent)
+         */
+        uint256 apy = 0;
+        if (totalDeposit > 0) {
+            apy = (latestReward * APYDENOMINATOR * 365 * rewardPercent) / totalDeposit / rewardCycle / 100;
+        }
+
+        return apy;
+    }
+
+    function apyOfVip1() external view returns (uint256) {
+        /**
+         * same as apyNotVip
+         * vip1RewardPercent - vip1 user's reward percent, default is 85% of totalReward
+         */
+        uint256 apy = 0;
+        if (totalDeposit > 0) {
+            apy =
+                (latestReward * APYDENOMINATOR * 365 * vip1RewardPercent) /
+                totalDeposit /
+                rewardCycle /
+                100;
+        }
+
+        return apy;
+    }
+
+    function apyOfVip2() external view returns (uint256) {
+        /**
+         * same as apyNotVip
+         * vip2RewardPercent - vip2 user's reward percent, default is 100% of totalReward
+         */
+        uint256 apy = 0;
+        if (totalDeposit > 0) {
+            apy =
+                (latestReward * APYDENOMINATOR * 365 * vip2RewardPercent) /
+                totalDeposit /
+                rewardCycle /
+                100;
+        }
+
+        return apy;
+    }
+
+    function getUserInfo(address _user)
+        external
+        view
+        returns (uint256, uint256)
+    {
+        return (userInfo[_user].depositedAmount, userInfo[_user].lockedTime);
+    }
+
+    function getUserStatus(address _user) public view returns (uint8) {
+        require(_user != address(0), "invalid address");
+
+        uint256 _decimals = depositTokenDecimals();
+
+        uint256 _usdAmountOfUser = userInfo[_user].depositedAmount / 10**_decimals;
+        if (_usdAmountOfUser >= vip2MinAmount) {
+            // this user is a vip2
+            return 3;
+        } else if (_usdAmountOfUser >= vip1MinAmount) {
+            // this user is a vip1
+            return 2;
+        } else {
+            // this user is not a vip
+            return 1;
+        }
+    }
+
+    function depositTokenDecimals() public view returns (uint256) {
+        return uint256(depositToken.decimals());
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        // On the first call to nonReentrant, _notEntered will be true
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+
+        _;
+
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+}
