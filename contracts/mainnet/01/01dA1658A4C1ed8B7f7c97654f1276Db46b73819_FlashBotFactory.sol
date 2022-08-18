@@ -1,0 +1,2105 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface AggregatorV3Interface {
+  function decimals() external view returns (uint8);
+
+  function description() external view returns (string memory);
+
+  function version() external view returns (uint256);
+
+  function getRoundData(uint80 _roundId)
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+
+  function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface KeeperCompatibleInterface {
+  /**
+   * @notice method that is simulated by the keepers to see if any work actually
+   * needs to be performed. This method does does not actually need to be
+   * executable, and since it is only ever simulated it can consume lots of gas.
+   * @dev To ensure that it is never called, you may want to add the
+   * cannotExecute modifier from KeeperBase to your implementation of this
+   * method.
+   * @param checkData specified in the upkeep registration so it is always the
+   * same for a registered upkeep. This can easily be broken down into specific
+   * arguments using `abi.decode`, so multiple upkeeps can be registered on the
+   * same contract and easily differentiated by the contract.
+   * @return upkeepNeeded boolean to indicate whether the keeper should call
+   * performUpkeep or not.
+   * @return performData bytes that the keeper should call performUpkeep with, if
+   * upkeep is needed. If you would like to encode data to decode later, try
+   * `abi.encode`.
+   */
+  function checkUpkeep(bytes calldata checkData) external returns (bool upkeepNeeded, bytes memory performData);
+
+  /**
+   * @notice method that is actually executed by the keepers, via the registry.
+   * The data returned by the checkUpkeep simulation will be passed into
+   * this method to actually be executed.
+   * @dev The input to this method should not be trusted, and the caller of the
+   * method should not even be restricted to any single registry. Anyone should
+   * be able call it, and the input should be validated, there is no guarantee
+   * that the data passed in is the performData returned from checkUpkeep. This
+   * could happen due to malicious keepers, racing keepers, or simply a state
+   * change while the performUpkeep transaction is waiting for confirmation.
+   * Always validate the data passed in.
+   * @param performData is the data which was passed back from the checkData
+   * simulation. If it is encoded, it can easily be decoded into other types by
+   * calling `abi.decode`. This data should not be trusted, and should be
+   * validated against the contract's current state.
+   */
+  function performUpkeep(bytes calldata performData) external;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/**
+ * @notice config of the registry
+ * @dev only used in params and return values
+ * @member paymentPremiumPPB payment premium rate oracles receive on top of
+ * being reimbursed for gas, measured in parts per billion
+ * @member flatFeeMicroLink flat fee paid to oracles for performing upkeeps,
+ * priced in MicroLink; can be used in conjunction with or independently of
+ * paymentPremiumPPB
+ * @member blockCountPerTurn number of blocks each oracle has during their turn to
+ * perform upkeep before it will be the next keeper's turn to submit
+ * @member checkGasLimit gas limit when checking for upkeep
+ * @member stalenessSeconds number of seconds that is allowed for feed data to
+ * be stale before switching to the fallback pricing
+ * @member gasCeilingMultiplier multiplier to apply to the fast gas feed price
+ * when calculating the payment ceiling for keepers
+ * @member minUpkeepSpend minimum LINK that an upkeep must spend before cancelling
+ * @member maxPerformGas max executeGas allowed for an upkeep on this registry
+ * @member fallbackGasPrice gas price used if the gas price feed is stale
+ * @member fallbackLinkPrice LINK price used if the LINK price feed is stale
+ * @member transcoder address of the transcoder contract
+ * @member registrar address of the registrar contract
+ */
+struct Config {
+  uint32 paymentPremiumPPB;
+  uint32 flatFeeMicroLink; // min 0.000001 LINK, max 4294 LINK
+  uint24 blockCountPerTurn;
+  uint32 checkGasLimit;
+  uint24 stalenessSeconds;
+  uint16 gasCeilingMultiplier;
+  uint96 minUpkeepSpend;
+  uint32 maxPerformGas;
+  uint256 fallbackGasPrice;
+  uint256 fallbackLinkPrice;
+  address transcoder;
+  address registrar;
+}
+
+/**
+ * @notice config of the registry
+ * @dev only used in params and return values
+ * @member nonce used for ID generation
+ * @ownerLinkBalance withdrawable balance of LINK by contract owner
+ * @numUpkeeps total number of upkeeps on the registry
+ */
+struct State {
+  uint32 nonce;
+  uint96 ownerLinkBalance;
+  uint256 expectedLinkBalance;
+  uint256 numUpkeeps;
+}
+
+interface KeeperRegistryBaseInterface {
+  function registerUpkeep(
+    address target,
+    uint32 gasLimit,
+    address admin,
+    bytes calldata checkData
+  ) external returns (uint256 id);
+
+  function performUpkeep(uint256 id, bytes calldata performData) external returns (bool success);
+
+  function cancelUpkeep(uint256 id) external;
+
+  function addFunds(uint256 id, uint96 amount) external;
+
+  function setUpkeepGasLimit(uint256 id, uint32 gasLimit) external;
+
+  function getUpkeep(uint256 id)
+    external
+    view
+    returns (
+      address target,
+      uint32 executeGas,
+      bytes memory checkData,
+      uint96 balance,
+      address lastKeeper,
+      address admin,
+      uint64 maxValidBlocknumber,
+      uint96 amountSpent
+    );
+
+  function getActiveUpkeepIDs(uint256 startIndex, uint256 maxCount) external view returns (uint256[] memory);
+
+  function getKeeperInfo(address query)
+    external
+    view
+    returns (
+      address payee,
+      bool active,
+      uint96 balance
+    );
+
+  function getState()
+    external
+    view
+    returns (
+      State memory,
+      Config memory,
+      address[] memory
+    );
+}
+
+/**
+ * @dev The view methods are not actually marked as view in the implementation
+ * but we want them to be easily queried off-chain. Solidity will not compile
+ * if we actually inherit from this interface, so we document it here.
+ */
+interface KeeperRegistryInterface is KeeperRegistryBaseInterface {
+  function checkUpkeep(uint256 upkeepId, address from)
+    external
+    view
+    returns (
+      bytes memory performData,
+      uint256 maxLinkPayment,
+      uint256 gasLimit,
+      int256 gasWei,
+      int256 linkEth
+    );
+}
+
+interface KeeperRegistryExecutableInterface is KeeperRegistryBaseInterface {
+  function checkUpkeep(uint256 upkeepId, address from)
+    external
+    returns (
+      bytes memory performData,
+      uint256 maxLinkPayment,
+      uint256 gasLimit,
+      uint256 adjustedGasWei,
+      uint256 linkEth
+    );
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20Permit {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+import "../extensions/draft-IERC20Permit.sol";
+import "../../../utils/Address.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20 {
+    using Address for address;
+
+    function safeTransfer(
+        IERC20 token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    function safeIncreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 newAllowance = token.allowance(address(this), spender) + value;
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+    }
+
+    function safeDecreaseAllowance(
+        IERC20 token,
+        address spender,
+        uint256 value
+    ) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            uint256 newAllowance = oldAllowance - value;
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+        }
+    }
+
+    function safePermit(
+        IERC20Permit token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address.functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCall(target, data, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        require(isContract(target), "Address: call to non-contract");
+
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        require(isContract(target), "Address: static call to non-contract");
+
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function functionDelegateCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(isContract(target), "Address: delegate call to non-contract");
+
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            // Look for revert reason and bubble it up if present
+            if (returndata.length > 0) {
+                // The easiest way to bubble the revert reason is using memory via assembly
+                /// @solidity memory-safe-assembly
+                assembly {
+                    let returndata_size := mload(returndata)
+                    revert(add(32, returndata), returndata_size)
+                }
+            } else {
+                revert(errorMessage);
+            }
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (utils/math/SafeMath.sol)
+
+pragma solidity ^0.8.0;
+
+// CAUTION
+// This version of SafeMath should only be used with Solidity 0.8 or later,
+// because it relies on the compiler's built in overflow checks.
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations.
+ *
+ * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler
+ * now has built in overflow checking.
+ */
+library SafeMath {
+    /**
+     * @dev Returns the addition of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            uint256 c = a + b;
+            if (c < a) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b > a) return (false, 0);
+            return (true, a - b);
+        }
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+            // benefit is lost if 'b' is also tested.
+            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+            if (a == 0) return (true, 0);
+            uint256 c = a * b;
+            if (c / a != b) return (false, 0);
+            return (true, c);
+        }
+    }
+
+    /**
+     * @dev Returns the division of two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a / b);
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.
+     *
+     * _Available since v3.4._
+     */
+    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {
+        unchecked {
+            if (b == 0) return (false, 0);
+            return (true, a % b);
+        }
+    }
+
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a - b;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a * b;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator.
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a / b;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a % b;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {trySub}.
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b <= a, errorMessage);
+            return a - b;
+        }
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers, reverting with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a / b;
+        }
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * reverting with custom message when dividing by zero.
+     *
+     * CAUTION: This function is deprecated because it requires allocating memory for the error
+     * message unnecessarily. For custom revert reasons use {tryMod}.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(
+        uint256 a,
+        uint256 b,
+        string memory errorMessage
+    ) internal pure returns (uint256) {
+        unchecked {
+            require(b > 0, errorMessage);
+            return a % b;
+        }
+    }
+}
+
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {IERC20} from './@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import {SafeERC20} from './@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import {SafeMath} from './@openzeppelin/contracts/utils/math/SafeMath.sol';
+import {KeeperCompatibleInterface} from './@chainlink/contracts/src/v0.8/interfaces/KeeperCompatibleInterface.sol';
+import {AggregatorV3Interface} from './@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol';
+import {IFlashLiquidityPair} from './interfaces/IFlashLiquidityPair.sol';
+import {Decimal} from './libraries/Decimal.sol';
+import {Governable} from './types/Governable.sol';
+
+struct OrderedReserves {
+    uint256 a1; // base asset
+    uint256 b1;
+    uint256 a2;
+    uint256 b2;
+}
+
+struct CallbackData {
+    address debtPool;
+    address targetPool;
+    bool debtTokenSmaller;
+    address borrowedToken;
+    address debtToken;
+    uint256 debtAmount;
+    uint256 debtTokenOutAmount;
+}
+
+contract FlashBot is Governable, KeeperCompatibleInterface {
+    using Decimal for Decimal.D256;
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+
+    address private immutable WETH;
+    address public immutable rewardToken;
+    address public immutable flashSwapFarm;
+
+    address public immutable flashPool;
+    address[] public extPools;
+    address public immutable feeTo;
+    address private permissionedPairAddress = address(1);
+    uint256 private immutable gasLimit;
+    uint256 public reserveProfitRatio;
+    uint256 public gasProfitMultiplier;
+
+    AggregatorV3Interface private fastGasFeed;
+    AggregatorV3Interface private wethPriceFeed;
+    AggregatorV3Interface private rewardTokenPriceFeed; 
+
+    event DepositedProfits(address indexed _to, uint256 indexed _value);
+    event OwnershipTransferred(address indexed _owner);
+    event ExtPoolsChanged(address[] indexed _oldPools, address[] indexed _newPools);
+    event ReserveProfitRatioChanged(uint256 indexed _oldRatio, uint256 indexed _newRatio);
+    event GasProfitMultiplierChanged(uint256 indexed _oldProfit, uint256 indexed _newProfit);
+
+    constructor(
+        address _governor,
+        address _WETH,
+        address _rewardToken,
+        address _flashSwapFarm,
+        address _flashPool,
+        address[] memory _extPools,
+        address _feeTo,
+        address _fastGasFeed,
+        address _wethPriceFeed,
+        address _rewardTokenPriceFeed,
+        uint256 _reserveProfitRatio,
+        uint256 _gasProfitMultiplier,
+        uint256 _transferGovernanceDelay,
+        uint32 _gasLimit
+    ) Governable(_governor, _transferGovernanceDelay) {
+        WETH = _WETH;
+        rewardToken = _rewardToken;
+        flashSwapFarm = _flashSwapFarm;
+        flashPool = _flashPool;
+        extPools = _extPools;
+        feeTo = _feeTo;
+        fastGasFeed = AggregatorV3Interface(_fastGasFeed);
+        wethPriceFeed = AggregatorV3Interface(_wethPriceFeed);
+        rewardTokenPriceFeed = AggregatorV3Interface(_rewardTokenPriceFeed);
+        reserveProfitRatio = _reserveProfitRatio;
+        gasProfitMultiplier = _gasProfitMultiplier;
+        gasLimit = _gasLimit;
+    }
+
+    receive() external payable {}
+
+    /// @dev Redirect uniswap callback function
+    /// The callback function on different DEX are not same, so use a fallback to redirect to uniswapV2Call
+    fallback(bytes calldata _input) external returns (bytes memory) {
+        (address sender, uint256 amount0, uint256 amount1, bytes memory data) = abi.decode(_input[4:], (address, uint256, uint256, bytes));
+        uniswapV2Call(sender, amount0, amount1, data);
+        return "0x";
+    }
+
+    function transferOwnership(address _governor) external onlyGovernor {
+        governor = _governor;
+        emit OwnershipTransferred(_governor);
+    }
+
+    function setExtPools(address[] memory _extPools) external onlyGovernor {
+        address[] memory _oldPools = extPools;
+        extPools = _extPools;
+        emit ExtPoolsChanged(_oldPools, _extPools);
+    }
+
+    function setReserveProfitRatio(uint256 _reserveProfitRatio) external onlyGovernor {
+        uint256 _oldRatio = reserveProfitRatio;
+        reserveProfitRatio = _reserveProfitRatio;
+        emit ReserveProfitRatioChanged(_oldRatio, _reserveProfitRatio);
+    }
+
+    function setGasProfitMultiplier(uint16 _gasProfitMultiplier) external onlyGovernor {
+        uint256 _oldGasMultiplier = gasProfitMultiplier;
+        gasProfitMultiplier = _gasProfitMultiplier;
+        emit GasProfitMultiplierChanged(_oldGasMultiplier, _gasProfitMultiplier);
+    }
+    
+    function setFastGasFeed(address _fastGasFeed) external onlyGovernor {
+        fastGasFeed = AggregatorV3Interface(_fastGasFeed);
+    }
+
+    function setWethPriceFeed(address _wethPriceFeed) external onlyGovernor {
+        wethPriceFeed = AggregatorV3Interface(_wethPriceFeed);
+    }
+
+    function setRewardTokenPriceFeed(address _rewardTokenPriceFeed) external onlyGovernor {
+        rewardTokenPriceFeed = AggregatorV3Interface(_rewardTokenPriceFeed);
+    }
+
+    function checkUpkeep(bytes calldata) 
+        external
+        override
+        view
+        returns (
+            bool upkeepNeeded, 
+            bytes memory performData
+        )
+    {
+        uint8 bestProfitIndex;
+        uint256 bestProfit;
+        uint256 tempProfit;
+        int rewardTokenPriceInWeth = 1e18;
+        if(rewardToken != WETH) {
+            rewardTokenPriceInWeth = getDerivedPrice();
+        }
+
+        for(uint8 i = 0; i < extPools.length; i++) {
+            tempProfit = getProfit(flashPool, extPools[i]);
+            if(tempProfit > bestProfit) {
+                bestProfitIndex = i;
+                bestProfit = tempProfit;
+            }
+        }
+        if(bestProfit.div(1e10).mul(uint256(rewardTokenPriceInWeth)) > getDynamicProfit(uint256(rewardTokenPriceInWeth))) {
+            upkeepNeeded = true;
+            performData = abi.encode(extPools[bestProfitIndex]);
+        }
+    }
+
+    function performUpkeep(bytes calldata performData) external override {
+        flashArbitrage(flashPool, abi.decode(performData, (address)));
+    }
+
+    function getDerivedPrice()
+        public
+        view
+        returns (int256)
+    {
+        int256 decimals = int256(10 ** uint256(18));
+        ( , int256 basePrice, , , ) = rewardTokenPriceFeed.latestRoundData();
+        uint8 baseDecimals = rewardTokenPriceFeed.decimals();
+        basePrice = scalePrice(basePrice, baseDecimals, 18);
+
+        ( , int256 quotePrice, , , ) = wethPriceFeed.latestRoundData();
+        uint8 quoteDecimals = wethPriceFeed.decimals();
+        quotePrice = scalePrice(quotePrice, quoteDecimals, 18);
+
+        return basePrice * decimals / quotePrice;
+    }
+
+    function scalePrice(int256 _price, uint8 _priceDecimals, uint8 _decimals)
+        internal
+        pure
+        returns (int256)
+    {
+        if (_priceDecimals < _decimals) {
+            return _price * int256(10 ** uint256(_decimals - _priceDecimals));
+        } else if (_priceDecimals > _decimals) {
+            return _price / int256(10 ** uint256(_priceDecimals - _decimals));
+        }
+        return _price;
+    }
+
+    function getDynamicProfit(uint256 _rewardTokenPriceInWeth)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 minProfitInWeth = IERC20(rewardToken).balanceOf(flashPool)
+                                                    .div(reserveProfitRatio)
+                                                    .mul(_rewardTokenPriceInWeth)
+                                                    .div(1e10);
+
+        if(address(fastGasFeed) != address(0)) {
+            (, int gasPrice, , ,) = fastGasFeed.latestRoundData();
+            if(gasPrice > 0) {
+                minProfitInWeth += gasProfitMultiplier.mul(uint256(gasPrice))
+                                                    .mul(gasLimit)
+                                                    .mul(1e8);
+            } 
+        }
+        return minProfitInWeth;
+    }
+
+    function withdraw() internal {
+        uint256 balance = IERC20(rewardToken).balanceOf(address(this));
+        if (balance > 0) {
+            uint256 fee = balance.div(50); // 2%
+            balance = balance.sub(fee);
+            IERC20(rewardToken).safeTransfer(feeTo, fee);
+            IERC20(rewardToken).safeTransfer(flashSwapFarm, balance);
+            emit DepositedProfits(flashSwapFarm, balance);
+        }
+    }
+
+    function isbaseTokenSmaller(address pool0, address pool1)
+        internal
+        view
+        returns (
+            bool baseSmaller,
+            address baseToken,
+            address quoteToken
+        )
+    {
+        require(pool0 != pool1, 'Same pair address');
+        (address pool0Token0, address pool0Token1) = (IFlashLiquidityPair(pool0).token0(), IFlashLiquidityPair(pool0).token1());
+        (address pool1Token0, address pool1Token1) = (IFlashLiquidityPair(pool1).token0(), IFlashLiquidityPair(pool1).token1());
+        require(pool0Token0 < pool0Token1 && pool1Token0 < pool1Token1, 'Non standard uniswap AMM pair');
+        require(pool0Token0 == pool1Token0 && pool0Token1 == pool1Token1, 'Require same token pair');
+        require(rewardToken == pool0Token0 || rewardToken == pool0Token1, 'No base token in pair');
+
+        (baseSmaller, baseToken, quoteToken) = (rewardToken == pool0Token0)
+            ? (true, pool0Token0, pool0Token1)
+            : (false, pool0Token1, pool0Token0);
+    }
+
+    /// @dev Compare price denominated in quote token between two pools
+    /// We borrow base token by using flash swap from lower price pool and sell them to higher price pool
+    function getOrderedReserves(
+        address pool0,
+        address pool1,
+        bool baseTokenSmaller
+    )
+        internal
+        view
+        returns (
+            address lowerPool,
+            address higherPool,
+            OrderedReserves memory orderedReserves
+        )
+    {
+        (uint256 pool0Reserve0, uint256 pool0Reserve1, ) = IFlashLiquidityPair(pool0).getReserves();
+        (uint256 pool1Reserve0, uint256 pool1Reserve1, ) = IFlashLiquidityPair(pool1).getReserves();
+
+        // Calculate the price denominated in quote asset token
+        (Decimal.D256 memory price0, Decimal.D256 memory price1) =
+            baseTokenSmaller
+                ? (Decimal.from(pool0Reserve0).div(pool0Reserve1), Decimal.from(pool1Reserve0).div(pool1Reserve1))
+                : (Decimal.from(pool0Reserve1).div(pool0Reserve0), Decimal.from(pool1Reserve1).div(pool1Reserve0));
+
+        // get a1, b1, a2, b2 with following rule:
+        // 1. (a1, b1) represents the pool with lower price, denominated in quote asset token
+        // 2. (a1, a2) are the base tokens in two pools
+        if (price0.lessThan(price1)) {
+            (lowerPool, higherPool) = (pool0, pool1);
+            (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
+                ? (pool0Reserve0, pool0Reserve1, pool1Reserve0, pool1Reserve1)
+                : (pool0Reserve1, pool0Reserve0, pool1Reserve1, pool1Reserve0);
+        } else {
+            (lowerPool, higherPool) = (pool1, pool0);
+            (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
+                ? (pool1Reserve0, pool1Reserve1, pool0Reserve0, pool0Reserve1)
+                : (pool1Reserve1, pool1Reserve0, pool0Reserve1, pool0Reserve0);
+        }
+    }
+
+    /// @notice Do an arbitrage between two Uniswap-like AMM pools
+    /// @dev Two pools must contains same token pair
+    function flashArbitrage(address pool0, address pool1) public {
+        address _baseToken;
+        address _quoteToken;
+        bool _baseTokenSmaller;
+        address _lowerPool; // pool with lower price, denominated in quote asset
+        address _higherPool; // pool with higher price, denominated in quote asset
+
+        (_baseTokenSmaller, _baseToken, _quoteToken) = isbaseTokenSmaller(pool0, pool1);
+
+        OrderedReserves memory orderedReserves;
+        (_lowerPool, _higherPool, orderedReserves) = getOrderedReserves(pool0, pool1, _baseTokenSmaller);
+
+        // this must be updated every transaction for callback origin authentication
+        permissionedPairAddress = _lowerPool;
+
+        uint256 balanceBefore = IERC20(_baseToken).balanceOf(address(this));
+
+        // avoid stack too deep error
+        {
+            uint256 borrowAmount = calcBorrowAmount(orderedReserves);
+            (uint256 amount0Out, uint256 amount1Out) =
+                _baseTokenSmaller ? (uint256(0), borrowAmount) : (borrowAmount, uint256(0));
+            // borrow quote token on lower price pool, calculate how much debt we need to pay demoninated in base token
+            uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
+            // sell borrowed quote token on higher price pool, calculate how much base token we can get
+            uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
+            require(baseTokenOutAmount > debtAmount, 'Arbitrage fail, no profit');
+
+            // can only initialize this way to avoid stack too deep error
+            CallbackData memory callbackData;
+            callbackData.debtPool = _lowerPool;
+            callbackData.targetPool = _higherPool;
+            callbackData.debtTokenSmaller = _baseTokenSmaller;
+            callbackData.borrowedToken = _quoteToken;
+            callbackData.debtToken = _baseToken;
+            callbackData.debtAmount = debtAmount;
+            callbackData.debtTokenOutAmount = baseTokenOutAmount;
+
+            bytes memory data = abi.encode(callbackData);
+            IFlashLiquidityPair(_lowerPool).swap(amount0Out, amount1Out, address(this), data);
+        }
+
+        uint256 balanceAfter = IERC20(_baseToken).balanceOf(address(this));
+        require(balanceAfter > balanceBefore, 'Losing money');
+        permissionedPairAddress = address(1);
+        withdraw();
+    }
+
+    function uniswapV2Call(
+        address sender,
+        uint256 amount0,
+        uint256 amount1,
+        bytes memory data
+    ) public {
+        // access control
+        require(msg.sender == permissionedPairAddress, 'Non permissioned address call');
+        require(sender == address(this), 'Not from this contract');
+
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        CallbackData memory info = abi.decode(data, (CallbackData));
+
+        IERC20(info.borrowedToken).safeTransfer(info.targetPool, borrowedAmount);
+
+        (uint256 amount0Out, uint256 amount1Out) =
+            info.debtTokenSmaller ? (info.debtTokenOutAmount, uint256(0)) : (uint256(0), info.debtTokenOutAmount);
+        IFlashLiquidityPair(info.targetPool).swap(amount0Out, amount1Out, address(this), new bytes(0));
+
+        IERC20(info.debtToken).safeTransfer(info.debtPool, info.debtAmount);
+    }
+
+    /// @notice Calculate how much profit we can by arbitraging between two pools
+    function getProfit(address pool0, address pool1) public view returns (uint256 profit) {
+        (bool baseTokenSmaller, , ) = isbaseTokenSmaller(pool0, pool1);
+        //baseToken = baseTokenSmaller ? IUniswapV2Pair(pool0).token0() : IUniswapV2Pair(pool0).token1();
+
+        (, , OrderedReserves memory orderedReserves) = getOrderedReserves(pool0, pool1, baseTokenSmaller);
+
+        uint256 borrowAmount = calcBorrowAmount(orderedReserves);
+        // borrow quote token on lower price pool,
+        uint256 debtAmount = getAmountIn(borrowAmount, orderedReserves.a1, orderedReserves.b1);
+        // sell borrowed quote token on higher price pool
+        uint256 baseTokenOutAmount = getAmountOut(borrowAmount, orderedReserves.b2, orderedReserves.a2);
+        if (baseTokenOutAmount < debtAmount) {
+            profit = 0;
+        } else {
+            profit = baseTokenOutAmount - debtAmount;
+        }
+    }
+
+    /// @dev calculate the maximum base asset amount to borrow in order to get maximum profit during arbitrage
+    function calcBorrowAmount(OrderedReserves memory reserves) internal pure returns (uint256 amount) {
+        // we can't use a1,b1,a2,b2 directly, because it will result overflow/underflow on the intermediate result
+        // so we:
+        //    1. divide all the numbers by d to prevent from overflow/underflow
+        //    2. calculate the result by using above numbers
+        //    3. multiply d with the result to get the final result
+        // Note: this workaround is only suitable for ERC20 token with 18 decimals, which I believe most tokens do
+
+        uint256 min1 = reserves.a1 < reserves.b1 ? reserves.a1 : reserves.b1;
+        uint256 min2 = reserves.a2 < reserves.b2 ? reserves.a2 : reserves.b2;
+        uint256 min = min1 < min2 ? min1 : min2;
+
+        // choose appropriate number to divide based on the minimum number
+        uint256 d;
+        if (min > 1e24) {
+            d = 1e20;
+        } else if (min > 1e23) {
+            d = 1e19;
+        } else if (min > 1e22) {
+            d = 1e18;
+        } else if (min > 1e21) {
+            d = 1e17;
+        } else if (min > 1e20) {
+            d = 1e16;
+        } else if (min > 1e19) {
+            d = 1e15;
+        } else if (min > 1e18) {
+            d = 1e14;
+        } else if (min > 1e17) {
+            d = 1e13;
+        } else if (min > 1e16) {
+            d = 1e12;
+        } else if (min > 1e15) {
+            d = 1e11;
+        } else {
+            d = 1e10;
+        }
+
+        (int256 a1, int256 a2, int256 b1, int256 b2) =
+            (int256(reserves.a1 / d), int256(reserves.a2 / d), int256(reserves.b1 / d), int256(reserves.b2 / d));
+
+        int256 a = a1 * b1 - a2 * b2;
+        int256 b = 2 * b1 * b2 * (a1 + a2);
+        int256 c = b1 * b2 * (a1 * b2 - a2 * b1);
+
+        (int256 x1, int256 x2) = calcSolutionForQuadratic(a, b, c);
+
+        // 0 < x < b1 and 0 < x < b2
+        require((x1 > 0 && x1 < b1 && x1 < b2) || (x2 > 0 && x2 < b1 && x2 < b2), 'Wrong input order');
+        amount = (x1 > 0 && x1 < b1 && x1 < b2) ? uint256(x1) * d : uint256(x2) * d;
+    }
+
+    /// @dev find solution of quadratic equation: ax^2 + bx + c = 0, only return the positive solution
+    function calcSolutionForQuadratic(
+        int256 a,
+        int256 b,
+        int256 c
+    ) internal pure returns (int256 x1, int256 x2) {
+        int256 m = b**2 - 4 * a * c;
+        // m < 0 leads to complex number
+        require(m > 0, 'Complex number');
+
+        int256 sqrtM = int256(sqrt(uint256(m)));
+        x1 = (-b + sqrtM) / (2 * a);
+        x2 = (-b - sqrtM) / (2 * a);
+    }
+
+    /// @dev Newton’s method for caculating square root of n
+    function sqrt(uint256 n) internal pure returns (uint256 res) {
+        assert(n > 1);
+
+        // The scale factor is a crude way to turn everything into integer calcs.
+        // Actually do (n * 10 ^ 4) ^ (1/2)
+        uint256 _n = n * 10**6;
+        uint256 c = _n;
+        res = _n;
+
+        uint256 xi;
+        while (true) {
+            xi = (res + c / res) / 2;
+            // don't need be too precise to save gas
+            if (res - xi < 1000) {
+                break;
+            }
+            res = xi;
+        }
+        res = res / 10**3;
+    }
+
+    // copy from UniswapV2Library
+    // given an output amount of an asset and pair reserves, returns a required input amount of the other asset
+    function getAmountIn(
+        uint256 amountOut,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256 amountIn) {
+        require(amountOut > 0, 'FlashBot: INSUFFICIENT_OUTPUT_AMOUNT');
+        require(reserveIn > 0 && reserveOut > 0, 'FlashBot: INSUFFICIENT_LIQUIDITY');
+        uint256 numerator = reserveIn.mul(amountOut).mul(1000);
+        uint256 denominator = reserveOut.sub(amountOut).mul(997);
+        amountIn = (numerator / denominator).add(1);
+    }
+
+    // copy from UniswapV2Library
+    // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
+    function getAmountOut(
+        uint256 amountIn,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256 amountOut) {
+        require(amountIn > 0, 'FlashBot: INSUFFICIENT_INPUT_AMOUNT');
+        require(reserveIn > 0 && reserveOut > 0, 'FlashBot: INSUFFICIENT_LIQUIDITY');
+        uint256 amountInWithFee = amountIn.mul(997);
+        uint256 numerator = amountInWithFee.mul(reserveOut);
+        uint256 denominator = reserveIn.mul(1000).add(amountInWithFee);
+        amountOut = numerator / denominator;
+    }
+}
+
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {FlashBot} from './FlashBot.sol';
+import {IFlashBotFactory} from './interfaces/IFlashBotFactory.sol';
+import {IUpkeepsStation} from './interfaces/IUpkeepsStation.sol';
+import {BastionConnector} from './types/BastionConnector.sol';
+
+contract FlashBotFactory is IFlashBotFactory, BastionConnector {
+
+    address private immutable WETH;
+    mapping(address => address) public poolflashBot;
+
+    constructor(
+        address _WETH,
+        address _governor,
+        uint256 _transferGovernanceDelay
+    ) BastionConnector(_governor, _transferGovernanceDelay) {
+        WETH = _WETH;
+    }
+
+    function initialize(address _bastion) external onlyGovernor {
+        initializeConnector(_bastion);
+    }
+    
+    function deployFlashbot(
+        address _rewardToken,
+        address _flashSwapFarm,
+        address _flashPool,
+        address[] calldata _extPools,
+        address _fastGasFeed,
+        address _wethPriceFeed,
+        address _rewardTokenPriceFeed,
+        uint256 _reserveProfitRatio,
+        uint256 _gasProfitMultiplier,
+        uint32 _gasLimit
+    ) external onlyBastion onlyWhenInitialized returns (address _flashbot) {
+        _flashbot = address(
+            new FlashBot(
+                governor,
+                WETH,
+                _rewardToken,
+                _flashSwapFarm,
+                _flashPool,
+                _extPools,
+                bastion,
+                _fastGasFeed,
+                _wethPriceFeed,
+                _rewardTokenPriceFeed,
+                _reserveProfitRatio,
+                _gasProfitMultiplier,
+                transferGovernanceDelay,
+                _gasLimit
+            )
+        );
+        poolflashBot[_flashPool] = _flashbot;
+        emit FlashBotDeployed(_flashPool, _flashbot);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IFlashBotFactory {
+
+    event FlashBotDeployed(address indexed _flashPool, address indexed _bot);
+
+    function poolflashBot(address) external view returns(address);
+
+    function deployFlashbot(
+        address _rewardToken,
+        address _flashSwapFarm,
+        address _flashPool,
+        address[] calldata _extPools,
+        address _fastGasFeed,
+        address _wethPriceFeed,
+        address _rewardTokenPriceFeed,
+        uint256 _reserveProfitRatio,
+        uint256 _gasProfitMultiplier,
+        uint32 _gasLimit
+    ) external returns (address _flashbot);
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity >=0.5.0;
+
+interface IFlashLiquidityPair {
+    event Approval(address indexed owner, address indexed spender, uint value);
+    event Transfer(address indexed from, address indexed to, uint value);
+
+    function name() external pure returns (string memory);
+    function symbol() external pure returns (string memory);
+    function decimals() external pure returns (uint8);
+    function totalSupply() external view returns (uint);
+    function balanceOf(address owner) external view returns (uint);
+    function allowance(address owner, address spender) external view returns (uint);
+    function flashbot() external view returns (address);
+    
+    function approve(address spender, uint value) external returns (bool);
+    function transfer(address to, uint value) external returns (bool);
+    function transferFrom(address from, address to, uint value) external returns (bool);
+
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+    function PERMIT_TYPEHASH() external pure returns (bytes32);
+    function nonces(address owner) external view returns (uint);
+
+    function permit(address owner, address spender, uint value, uint deadline, uint8 v, bytes32 r, bytes32 s) external;
+
+    event Mint(address indexed sender, uint amount0, uint amount1);
+    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    function MINIMUM_LIQUIDITY() external pure returns (uint);
+    function factory() external view returns (address);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function price0CumulativeLast() external view returns (uint);
+    function price1CumulativeLast() external view returns (uint);
+    function kLast() external view returns (uint);
+
+    function mint(address to) external returns (uint liquidity);
+    function burn(address to) external returns (uint amount0, uint amount1);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+    function skim(address to) external;
+    function sync() external;
+
+    function initialize(address, address) external;
+    function setFlashbot(address) external;
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+interface IUpkeepsStation {
+
+    event UpkeepRegistered(uint256 indexed _id);
+    event UpkeepRemoved(uint256 indexed _id);
+    event UpkeepRefueled(uint256 indexed _id, uint96 indexed _amount);
+    event TransferredToStation(address[] indexed _tokens, uint256[] indexed _amounts);
+
+    function isRegisteredUpkeep(uint256 _upkeepId) external view returns(bool);
+    function doesUpkeepNeedFunds(uint256 _upkeepId) external view returns(bool needFunds);
+
+    function transferToStation(
+        address[] calldata _tokens, 
+        uint256[] calldata _amounts
+    ) external;
+
+    function addUpkeep(uint256 _upkeepId, address _flashbot) external;
+    function removeUpkeep(address _flashbot) external;
+    function withdrawCanceledUpkeeps(uint256 _upkeepsNumber) external;
+}
+
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+pragma experimental ABIEncoderV2;
+
+import "./SafeMathCopy.sol";
+
+/**
+ * @title Decimal
+ * @author dYdX
+ *
+ * Library that defines a fixed-point number with 18 decimal places.
+ */
+library Decimal {
+    using SafeMathCopy for uint256;
+
+    // ============ Constants ============
+
+    uint256 private constant BASE = 10**18;
+
+    // ============ Structs ============
+
+
+    struct D256 {
+        uint256 value;
+    }
+
+    // ============ Static Functions ============
+
+    function zero()
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: 0 });
+    }
+
+    function one()
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: BASE });
+    }
+
+    function from(
+        uint256 a
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: a.mul(BASE) });
+    }
+
+    function ratio(
+        uint256 a,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: getPartial(a, BASE, b) });
+    }
+
+    // ============ Self Functions ============
+
+    function add(
+        D256 memory self,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.add(b.mul(BASE)) });
+    }
+
+    function sub(
+        D256 memory self,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.sub(b.mul(BASE)) });
+    }
+
+    function sub(
+        D256 memory self,
+        uint256 b,
+        string memory reason
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.sub(b.mul(BASE), reason) });
+    }
+
+    function mul(
+        D256 memory self,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.mul(b) });
+    }
+
+    function div(
+        D256 memory self,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.div(b) });
+    }
+
+    function pow(
+        D256 memory self,
+        uint256 b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        if (b == 0) {
+            return from(1);
+        }
+
+        D256 memory temp = D256({ value: self.value });
+        for (uint256 i = 1; i < b; i++) {
+            temp = mul(temp, self);
+        }
+
+        return temp;
+    }
+
+    function add(
+        D256 memory self,
+        D256 memory b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.add(b.value) });
+    }
+
+    function sub(
+        D256 memory self,
+        D256 memory b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.sub(b.value) });
+    }
+
+    function sub(
+        D256 memory self,
+        D256 memory b,
+        string memory reason
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: self.value.sub(b.value, reason) });
+    }
+
+    function mul(
+        D256 memory self,
+        D256 memory b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: getPartial(self.value, b.value, BASE) });
+    }
+
+    function div(
+        D256 memory self,
+        D256 memory b
+    )
+    internal
+    pure
+    returns (D256 memory)
+    {
+        return D256({ value: getPartial(self.value, BASE, b.value) });
+    }
+
+    function equals(D256 memory self, D256 memory b) internal pure returns (bool) {
+        return self.value == b.value;
+    }
+
+    function greaterThan(D256 memory self, D256 memory b) internal pure returns (bool) {
+        return compareTo(self, b) == 2;
+    }
+
+    function lessThan(D256 memory self, D256 memory b) internal pure returns (bool) {
+        return compareTo(self, b) == 0;
+    }
+
+    function greaterThanOrEqualTo(D256 memory self, D256 memory b) internal pure returns (bool) {
+        return compareTo(self, b) > 0;
+    }
+
+    function lessThanOrEqualTo(D256 memory self, D256 memory b) internal pure returns (bool) {
+        return compareTo(self, b) < 2;
+    }
+
+    function isZero(D256 memory self) internal pure returns (bool) {
+        return self.value == 0;
+    }
+
+    function asUint256(D256 memory self) internal pure returns (uint256) {
+        return self.value.div(BASE);
+    }
+
+    // ============ Core Methods ============
+
+    function getPartial(
+        uint256 target,
+        uint256 numerator,
+        uint256 denominator
+    )
+    private
+    pure
+    returns (uint256)
+    {
+        return target.mul(numerator).div(denominator);
+    }
+
+    function compareTo(
+        D256 memory a,
+        D256 memory b
+    )
+    private
+    pure
+    returns (uint256)
+    {
+        if (a.value == b.value) {
+            return 1;
+        }
+        return a.value > b.value ? 2 : 0;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+
+/**
+ * @dev Wrappers over Solidity's arithmetic operations with added overflow
+ * checks.
+ *
+ * Arithmetic operations in Solidity wrap on overflow. This can easily result
+ * in bugs, because programmers usually assume that an overflow raises an
+ * error, which is the standard behavior in high level programming languages.
+ * `SafeMath` restores this intuition by reverting the transaction when an
+ * operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ */
+library SafeMathCopy { // To avoid namespace collision between openzeppelin safemath and uniswap safemath
+    /**
+     * @dev Returns the addition of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `+` operator.
+     *
+     * Requirements:
+     *
+     * - Addition cannot overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        return sub(a, b, "SafeMath: subtraction overflow");
+    }
+
+    /**
+     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on
+     * overflow (when the result is negative).
+     *
+     * Counterpart to Solidity's `-` operator.
+     *
+     * Requirements:
+     *
+     * - Subtraction cannot overflow.
+     */
+    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b <= a, errorMessage);
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the multiplication of two unsigned integers, reverting on
+     * overflow.
+     *
+     * Counterpart to Solidity's `*` operator.
+     *
+     * Requirements:
+     *
+     * - Multiplication cannot overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        return div(a, b, "SafeMath: division by zero");
+    }
+
+    /**
+     * @dev Returns the integer division of two unsigned integers. Reverts with custom message on
+     * division by zero. The result is rounded towards zero.
+     *
+     * Counterpart to Solidity's `/` operator. Note: this function uses a
+     * `revert` opcode (which leaves remaining gas untouched) while Solidity
+     * uses an invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b > 0, errorMessage);
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
+
+        return c;
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        return mod(a, b, "SafeMath: modulo by zero");
+    }
+
+    /**
+     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),
+     * Reverts with custom message when dividing by zero.
+     *
+     * Counterpart to Solidity's `%` operator. This function uses a `revert`
+     * opcode (which leaves remaining gas untouched) while Solidity uses an
+     * invalid opcode to revert (consuming all remaining gas).
+     *
+     * Requirements:
+     *
+     * - The divisor cannot be zero.
+     */
+    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {
+        require(b != 0, errorMessage);
+        return a % b;
+    }
+}
+
+//SPDX-License-Identifier: Unlicense
+pragma solidity ^0.8.0;
+
+import '../@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import '../@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import '../@chainlink/contracts/src/v0.8/interfaces/KeeperRegistryInterface.sol';
+import './Governable.sol';
+
+abstract contract BastionConnector is Governable {
+    using SafeERC20 for IERC20;
+    bool private initialized;
+    address public bastion;
+
+    event ConnectorInitialized(address indexed _bastion);
+    event TransferredToBastion(address[] indexed _tokens, uint256[] indexed _amounts);
+
+    constructor(
+        address _governor,
+        uint256 _transferGovernanceDelay
+    ) Governable(_governor, _transferGovernanceDelay) {
+        initialized = false;
+    }
+
+    function isInitialized() internal view returns (bool) {
+        return initialized;
+    }
+
+    function initializeConnector(
+        address _bastion
+    ) internal onlyGovernor onlyWhenNotInitialized {
+        initialized = true;
+        bastion = _bastion;
+        emit ConnectorInitialized(_bastion);
+    }
+
+    function transferToBastion(
+        address[] calldata _tokens, 
+        uint256[] calldata _amounts
+    ) external onlyGovernor {
+        for(uint256 i = 0;i < _tokens.length; i++) {
+            IERC20(_tokens[i]).safeTransfer(bastion, _amounts[i]);
+        }
+        emit TransferredToBastion(_tokens, _amounts);
+    }
+
+    modifier onlyBastion() {
+        require(msg.sender == bastion, "Not Initialized");
+        _;        
+    }
+
+    modifier onlyWhenInitialized() {
+        require(initialized, "Not Initialized");
+        _;        
+    }
+
+    modifier onlyWhenNotInitialized() {
+        require(!initialized, "Already Initialized");
+        _;        
+    }
+}
+
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+abstract contract Governable {
+
+    address public governor;
+    address public pendingGovernor;
+    uint256 public requestTimestamp;
+    uint256 public immutable transferGovernanceDelay;
+
+    event GovernanceTrasferred(address indexed _oldGovernor, address indexed _newGovernor);
+    event PendingGovernorChanged(address indexed _pendingGovernor);
+
+    constructor(address _governor, uint256 _transferGovernanceDelay) {
+        governor = _governor;
+        transferGovernanceDelay = _transferGovernanceDelay;
+        emit GovernanceTrasferred(address(0), _governor);
+    }
+
+    modifier onlyGovernor() {
+        require(msg.sender == governor, "Only Governor");
+        _;
+    }
+
+    function setPendingGovernor(address _pendingGovernor) external onlyGovernor {
+        require(_pendingGovernor != address(0), "Zero Address");
+        pendingGovernor = _pendingGovernor;
+        requestTimestamp = block.timestamp;
+        emit PendingGovernorChanged(_pendingGovernor);
+    }
+
+    function transferGovernance() external {
+        address _newGovernor = pendingGovernor;
+        address _oldGovernor = governor;
+        require(_newGovernor != address(0), "Zero Address");
+        require(msg.sender == _oldGovernor || msg.sender == _newGovernor, "Forbidden");
+        require(block.timestamp - requestTimestamp > transferGovernanceDelay, "Too Early");
+        pendingGovernor = address(0);
+        governor = _newGovernor;
+        emit GovernanceTrasferred(_oldGovernor, _newGovernor);
+    }
+}
