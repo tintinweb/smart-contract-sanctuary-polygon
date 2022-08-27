@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import "./ISnowV1Program.sol";
+
+contract Sprite is ISnowV1Program {
+    uint8 private lastIndex;
+    uint8 private spriteIndex;
+
+    function name() external pure returns (string memory) {
+        return "Sprite";
+    }
+
+    function run(uint256[64] memory, uint8)
+        external
+        returns (uint8 index, uint256 value)
+    {
+        uint256[5] memory sprites = [
+            // Sprites created with https://snow.computer/operators
+            0x0000000000003e7e225222522052205226522252225222423e42000000000000,
+            0xffffffffffffc181ddadddaddfaddfadd9adddadddadddbdc1bdffffffffffff,
+            0x0000000000003e7e225222522052205226522252225222423e42000000000000,
+            0xffffffffffffc181ddadddaddfaddfadd9adddadddadddbdc1bdffffffffffff,
+            0x0000000000003e7e225222522052205226522252225222423e42000000000000
+        ];
+
+        spriteIndex = (spriteIndex + 1) % 5;
+        lastIndex = (lastIndex + 1) % 64;
+
+        return (lastIndex, sprites[spriteIndex]);
+    }
+}
+
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+interface ISnowV1Program {
+    function name() external view returns (string memory);
+
+    function run(uint256[64] memory canvas, uint8 lastUpdatedIndex)
+        external
+        returns (uint8 index, uint256 value);
+}
