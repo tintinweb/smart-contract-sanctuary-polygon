@@ -16,12 +16,15 @@ import random
 from retry import retry
 from bs4 import BeautifulSoup
 import json
+import time
 
 import logging
 
 logger = logging.getLogger(__name__)
 DEBUG_RAISE = False
 DEBUG_PRINT_CONTRACTS = False
+ts_start = time.time()
+TS_MAX = 1.5* 60 * 60  #1.5 hrs
 
 def is_json(myjson):
     try:
@@ -131,6 +134,9 @@ class EtherScanIoApi(object):
         page = start
 
         while not end or page <= end:
+            if time.time() - ts_start > TS_MAX:
+                print("ABORT - max time reached: 1.5 hrs")
+                exit(2)
             resp, pageResult = self._request_contract_list(page)                    
             page, lastpage = pageResult[0]
             page, lastpage = int(page),int(lastpage)
