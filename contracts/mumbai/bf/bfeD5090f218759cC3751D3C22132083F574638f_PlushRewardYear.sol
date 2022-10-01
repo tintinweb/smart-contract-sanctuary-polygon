@@ -1,0 +1,10601 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.3;
+
+import "../../interfaces/IPlushRewardYear.sol";
+
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+import "../../library/Date.sol";
+import "../../token/ERC721/LifeSpan.sol";
+import "../PlushAccounts.sol";
+import "../../governance/PlushBlacklist.sol";
+
+/// @custom:security-contact [email protected]
+contract PlushRewardYear is
+    IPlushRewardYear,
+    Initializable,
+    PausableUpgradeable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable,
+    Date
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    IERC20Upgradeable public plush;
+    PlushAccounts public plushAccounts;
+    LifeSpan public lifeSpan;
+    PlushBlacklist public plushBlacklist;
+
+    uint256 public rewardEveryDay;
+    uint256 public rewardMaxYear;
+
+    mapping(uint256 => Account) public lifeSpanAccounts;
+
+    modifier notBlacklisted(address _account) {
+        require(
+            !plushBlacklist.isBlacklisted(_account),
+            "Blacklist: account is blacklisted"
+        );
+        _;
+    }
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        IERC20Upgradeable _plush,
+        LifeSpan _lifeSpan,
+        PlushBlacklist _plushBlacklist,
+        PlushAccounts _plushAccounts,
+        uint256 _rewardEveryMonth,
+        uint256 _rewardMaxYear
+    ) public initializer {
+        plush = _plush;
+        lifeSpan = _lifeSpan;
+        plushAccounts = _plushAccounts;
+        plushBlacklist = _plushBlacklist;
+        rewardEveryDay = _rewardEveryMonth / 30;
+        rewardMaxYear = _rewardMaxYear;
+
+        __Pausable_init();
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /// @notice Pause contract
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause contract
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Check account balance
+     * @param lifeSpanId requesting account
+     * @return uint256 unlock balance in wei
+     */
+    function getBalance(uint256 lifeSpanId)
+    public
+    view
+    returns (uint256)
+    {
+        require(
+            lifeSpan.ownerOf(lifeSpanId) != address(0),
+            "Token does not exist"
+        );
+        require(
+            lifeSpan.getBirthdayDate(lifeSpanId) > 0,
+            "Birthday date empty"
+        );
+        require(
+            lifeSpan.getDateOfMint(lifeSpanId) > 0,
+            "Mint date empty"
+        );
+
+        DateT memory nowDay = DateT(getYear(block.timestamp), getMonth(block.timestamp), getDay(block.timestamp));
+        uint256 dateNowTimestamp = toTimestamp(nowDay.year, nowDay.month, nowDay.day, 0, 0, 0);
+
+        uint256 periodInDays = 0;
+
+        if(lifeSpanAccounts[lifeSpanId].lastDateWithdraw == 0){
+            DateT memory mint = DateT(getYear(lifeSpan.getDateOfMint(lifeSpanId)), getMonth(lifeSpan.getDateOfMint(lifeSpanId)), getDay(lifeSpan.getDateOfMint(lifeSpanId)));
+            periodInDays = (dateNowTimestamp - toTimestamp(mint.year, mint.month, mint.day, 0, 0, 0)) / 1 days;
+        }else{
+            periodInDays = (dateNowTimestamp - lifeSpanAccounts[lifeSpanId].lastDateWithdraw) / 1 days;
+        }
+
+        if((periodInDays * rewardEveryDay) > rewardMaxYear){
+            return rewardMaxYear;
+        }
+
+        return periodInDays * rewardEveryDay;
+    }
+
+    /**
+     * @notice Withdraw reward tokens
+     * @param lifeSpanId requesting account
+     */
+    function withdraw(uint256 lifeSpanId)
+    external
+    whenNotPaused
+    notBlacklisted(msg.sender)
+    {
+        require(
+            plush.balanceOf(address(this)) >= getBalance(lifeSpanId),
+            "The reward system is empty"
+        );
+        require(
+            isCanWithdraw(lifeSpanId) == true,
+            "Your birthday hasn't arrived yet"
+        );
+
+        plush.safeApprove(address(plushAccounts), getBalance(lifeSpanId));
+        plushAccounts.deposit(lifeSpan.ownerOf(lifeSpanId), getBalance(lifeSpanId));
+        lifeSpanAccounts[lifeSpanId].lastDateWithdraw = block.timestamp;
+    }
+
+    function isCanWithdraw(uint256 lifeSpanId)
+    public
+    view
+    returns (bool)
+    {
+        DateT memory nowDay = DateT(getYear(block.timestamp), getMonth(block.timestamp), getDay(block.timestamp));
+        DateT memory birthday = DateT(getYear(lifeSpan.getBirthdayDate(lifeSpanId)), getMonth(lifeSpan.getBirthdayDate(lifeSpanId)), getDay(lifeSpan.getBirthdayDate(lifeSpanId)));
+        DateT memory nextBirthdayMint = DateT(0, birthday.month, birthday.day);
+        DateT memory mint = DateT(getYear(lifeSpan.getDateOfMint(lifeSpanId)), getMonth(lifeSpan.getDateOfMint(lifeSpanId)), getDay(lifeSpan.getDateOfMint(lifeSpanId)));
+
+        if(lifeSpanAccounts[lifeSpanId].lastDateWithdraw == 0){
+            nextBirthdayMint.year = mint.year;
+            if(toTimestamp(mint.year, mint.month, mint.day, 0, 0, 0) > toTimestamp(mint.year, birthday.month, birthday.day, 0, 0, 0)){
+                nextBirthdayMint.year += 1;
+            }
+        }else{
+            DateT memory lastDateWithdrawDate = DateT(getYear(lifeSpanAccounts[lifeSpanId].lastDateWithdraw), getMonth(lifeSpanAccounts[lifeSpanId].lastDateWithdraw), getDay(lifeSpanAccounts[lifeSpanId].lastDateWithdraw));
+            nextBirthdayMint.year = lastDateWithdrawDate.year;
+
+            if(toTimestamp(lastDateWithdrawDate.year, lastDateWithdrawDate.month, lastDateWithdrawDate.day, 0, 0, 0) > toTimestamp(lastDateWithdrawDate.year, birthday.month, birthday.day, 0, 0, 0)){
+                nextBirthdayMint.year += 1;
+            }
+        }
+
+        if(toTimestamp(nowDay.year, nowDay.month, nowDay.day, 0, 0, 0) > toTimestamp(nextBirthdayMint.year, nextBirthdayMint.month, nextBirthdayMint.day, 0, 0, 0)){
+            return true;
+        }
+
+        return false;
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushRewardYear {
+    struct Account {
+        uint256 lastDateWithdraw;
+    }
+
+    struct DateT {
+        uint16 year;
+        uint8 month;
+        uint8 day;
+    }
+
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Check account balance
+     * @param lifeSpanId requesting account
+     * @return uint256 balance in wei
+     */
+    function getBalance(uint256 lifeSpanId)
+    external
+    view
+    returns (uint256);
+
+    /**
+     * @notice Withdraw reward tokens
+     * @param lifeSpanId requesting account
+     */
+    function withdraw(uint256 lifeSpanId)
+    external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (security/Pausable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/ContextUpgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module which allows children to implement an emergency stop
+ * mechanism that can be triggered by an authorized account.
+ *
+ * This module is used through inheritance. It will make available the
+ * modifiers `whenNotPaused` and `whenPaused`, which can be applied to
+ * the functions of your contract. Note that they will not be pausable by
+ * simply including this module, only once the modifiers are put in place.
+ */
+abstract contract PausableUpgradeable is Initializable, ContextUpgradeable {
+    /**
+     * @dev Emitted when the pause is triggered by `account`.
+     */
+    event Paused(address account);
+
+    /**
+     * @dev Emitted when the pause is lifted by `account`.
+     */
+    event Unpaused(address account);
+
+    bool private _paused;
+
+    /**
+     * @dev Initializes the contract in unpaused state.
+     */
+    function __Pausable_init() internal onlyInitializing {
+        __Pausable_init_unchained();
+    }
+
+    function __Pausable_init_unchained() internal onlyInitializing {
+        _paused = false;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is not paused.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    modifier whenNotPaused() {
+        _requireNotPaused();
+        _;
+    }
+
+    /**
+     * @dev Modifier to make a function callable only when the contract is paused.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    modifier whenPaused() {
+        _requirePaused();
+        _;
+    }
+
+    /**
+     * @dev Returns true if the contract is paused, and false otherwise.
+     */
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    /**
+     * @dev Throws if the contract is paused.
+     */
+    function _requireNotPaused() internal view virtual {
+        require(!paused(), "Pausable: paused");
+    }
+
+    /**
+     * @dev Throws if the contract is not paused.
+     */
+    function _requirePaused() internal view virtual {
+        require(paused(), "Pausable: not paused");
+    }
+
+    /**
+     * @dev Triggers stopped state.
+     *
+     * Requirements:
+     *
+     * - The contract must not be paused.
+     */
+    function _pause() internal virtual whenNotPaused {
+        _paused = true;
+        emit Paused(_msgSender());
+    }
+
+    /**
+     * @dev Returns to normal state.
+     *
+     * Requirements:
+     *
+     * - The contract must be paused.
+     */
+    function _unpause() internal virtual whenPaused {
+        _paused = false;
+        emit Unpaused(_msgSender());
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/AccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IAccessControlUpgradeable.sol";
+import "../utils/ContextUpgradeable.sol";
+import "../utils/StringsUpgradeable.sol";
+import "../utils/introspection/ERC165Upgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module that allows children to implement role-based access
+ * control mechanisms. This is a lightweight version that doesn't allow enumerating role
+ * members except through off-chain means by accessing the contract event logs. Some
+ * applications may benefit from on-chain enumerability, for those cases see
+ * {AccessControlEnumerable}.
+ *
+ * Roles are referred to by their `bytes32` identifier. These should be exposed
+ * in the external API and be unique. The best way to achieve this is by
+ * using `public constant` hash digests:
+ *
+ * ```
+ * bytes32 public constant MY_ROLE = keccak256("MY_ROLE");
+ * ```
+ *
+ * Roles can be used to represent a set of permissions. To restrict access to a
+ * function call, use {hasRole}:
+ *
+ * ```
+ * function foo() public {
+ *     require(hasRole(MY_ROLE, msg.sender));
+ *     ...
+ * }
+ * ```
+ *
+ * Roles can be granted and revoked dynamically via the {grantRole} and
+ * {revokeRole} functions. Each role has an associated admin role, and only
+ * accounts that have a role's admin role can call {grantRole} and {revokeRole}.
+ *
+ * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means
+ * that only accounts with this role will be able to grant or revoke other
+ * roles. More complex role relationships can be created by using
+ * {_setRoleAdmin}.
+ *
+ * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to
+ * grant and revoke this role. Extra precautions should be taken to secure
+ * accounts that have been granted it.
+ */
+abstract contract AccessControlUpgradeable is Initializable, ContextUpgradeable, IAccessControlUpgradeable, ERC165Upgradeable {
+    function __AccessControl_init() internal onlyInitializing {
+    }
+
+    function __AccessControl_init_unchained() internal onlyInitializing {
+    }
+    struct RoleData {
+        mapping(address => bool) members;
+        bytes32 adminRole;
+    }
+
+    mapping(bytes32 => RoleData) private _roles;
+
+    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
+
+    /**
+     * @dev Modifier that checks that an account has a specific role. Reverts
+     * with a standardized message including the required role.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     *
+     * _Available since v4.1._
+     */
+    modifier onlyRole(bytes32 role) {
+        _checkRole(role);
+        _;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IAccessControlUpgradeable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) public view virtual override returns (bool) {
+        return _roles[role].members[account];
+    }
+
+    /**
+     * @dev Revert with a standard message if `_msgSender()` is missing `role`.
+     * Overriding this function changes the behavior of the {onlyRole} modifier.
+     *
+     * Format of the revert message is described in {_checkRole}.
+     *
+     * _Available since v4.6._
+     */
+    function _checkRole(bytes32 role) internal view virtual {
+        _checkRole(role, _msgSender());
+    }
+
+    /**
+     * @dev Revert with a standard message if `account` is missing `role`.
+     *
+     * The format of the revert reason is given by the following regular expression:
+     *
+     *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/
+     */
+    function _checkRole(bytes32 role, address account) internal view virtual {
+        if (!hasRole(role, account)) {
+            revert(
+                string(
+                    abi.encodePacked(
+                        "AccessControl: account ",
+                        StringsUpgradeable.toHexString(uint160(account), 20),
+                        " is missing role ",
+                        StringsUpgradeable.toHexString(uint256(role), 32)
+                    )
+                )
+            );
+        }
+    }
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) public view virtual override returns (bytes32) {
+        return _roles[role].adminRole;
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function grantRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function revokeRole(bytes32 role, address account) public virtual override onlyRole(getRoleAdmin(role)) {
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been revoked `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function renounceRole(bytes32 role, address account) public virtual override {
+        require(account == _msgSender(), "AccessControl: can only renounce roles for self");
+
+        _revokeRole(role, account);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event. Note that unlike {grantRole}, this function doesn't perform any
+     * checks on the calling account.
+     *
+     * May emit a {RoleGranted} event.
+     *
+     * [WARNING]
+     * ====
+     * This function should only be called from the constructor when setting
+     * up the initial roles for the system.
+     *
+     * Using this function in any other way is effectively circumventing the admin
+     * system imposed by {AccessControl}.
+     * ====
+     *
+     * NOTE: This function is deprecated in favor of {_grantRole}.
+     */
+    function _setupRole(bytes32 role, address account) internal virtual {
+        _grantRole(role, account);
+    }
+
+    /**
+     * @dev Sets `adminRole` as ``role``'s admin role.
+     *
+     * Emits a {RoleAdminChanged} event.
+     */
+    function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {
+        bytes32 previousAdminRole = getRoleAdmin(role);
+        _roles[role].adminRole = adminRole;
+        emit RoleAdminChanged(role, previousAdminRole, adminRole);
+    }
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleGranted} event.
+     */
+    function _grantRole(bytes32 role, address account) internal virtual {
+        if (!hasRole(role, account)) {
+            _roles[role].members[account] = true;
+            emit RoleGranted(role, account, _msgSender());
+        }
+    }
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * Internal function without access restriction.
+     *
+     * May emit a {RoleRevoked} event.
+     */
+    function _revokeRole(bytes32 role, address account) internal virtual {
+        if (hasRole(role, account)) {
+            _roles[role].members[account] = false;
+            emit RoleRevoked(role, account, _msgSender());
+        }
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (proxy/utils/Initializable.sol)
+
+pragma solidity ^0.8.2;
+
+import "../../utils/AddressUpgradeable.sol";
+
+/**
+ * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed
+ * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an
+ * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer
+ * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.
+ *
+ * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be
+ * reused. This mechanism prevents re-execution of each "step" but allows the creation of new initialization steps in
+ * case an upgrade adds a module that needs to be initialized.
+ *
+ * For example:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```
+ * contract MyToken is ERC20Upgradeable {
+ *     function initialize() initializer public {
+ *         __ERC20_init("MyToken", "MTK");
+ *     }
+ * }
+ * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {
+ *     function initializeV2() reinitializer(2) public {
+ *         __ERC20Permit_init("MyToken");
+ *     }
+ * }
+ * ```
+ *
+ * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as
+ * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.
+ *
+ * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure
+ * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.
+ *
+ * [CAUTION]
+ * ====
+ * Avoid leaving a contract uninitialized.
+ *
+ * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation
+ * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke
+ * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:
+ *
+ * [.hljs-theme-light.nopadding]
+ * ```
+ * /// @custom:oz-upgrades-unsafe-allow constructor
+ * constructor() {
+ *     _disableInitializers();
+ * }
+ * ```
+ * ====
+ */
+abstract contract Initializable {
+    /**
+     * @dev Indicates that the contract has been initialized.
+     * @custom:oz-retyped-from bool
+     */
+    uint8 private _initialized;
+
+    /**
+     * @dev Indicates that the contract is in the process of being initialized.
+     */
+    bool private _initializing;
+
+    /**
+     * @dev Triggered when the contract has been initialized or reinitialized.
+     */
+    event Initialized(uint8 version);
+
+    /**
+     * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,
+     * `onlyInitializing` functions can be used to initialize parent contracts. Equivalent to `reinitializer(1)`.
+     */
+    modifier initializer() {
+        bool isTopLevelCall = !_initializing;
+        require(
+            (isTopLevelCall && _initialized < 1) || (!AddressUpgradeable.isContract(address(this)) && _initialized == 1),
+            "Initializable: contract is already initialized"
+        );
+        _initialized = 1;
+        if (isTopLevelCall) {
+            _initializing = true;
+        }
+        _;
+        if (isTopLevelCall) {
+            _initializing = false;
+            emit Initialized(1);
+        }
+    }
+
+    /**
+     * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the
+     * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be
+     * used to initialize parent contracts.
+     *
+     * `initializer` is equivalent to `reinitializer(1)`, so a reinitializer may be used after the original
+     * initialization step. This is essential to configure modules that are added through upgrades and that require
+     * initialization.
+     *
+     * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in
+     * a contract, executing them in the right order is up to the developer or operator.
+     */
+    modifier reinitializer(uint8 version) {
+        require(!_initializing && _initialized < version, "Initializable: contract is already initialized");
+        _initialized = version;
+        _initializing = true;
+        _;
+        _initializing = false;
+        emit Initialized(version);
+    }
+
+    /**
+     * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the
+     * {initializer} and {reinitializer} modifiers, directly or indirectly.
+     */
+    modifier onlyInitializing() {
+        require(_initializing, "Initializable: contract is not initializing");
+        _;
+    }
+
+    /**
+     * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.
+     * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized
+     * to any version. It is recommended to use this to lock implementation contracts that are designed to be called
+     * through proxies.
+     */
+    function _disableInitializers() internal virtual {
+        require(!_initializing, "Initializable: contract is initializing");
+        if (_initialized < type(uint8).max) {
+            _initialized = type(uint8).max;
+            emit Initialized(type(uint8).max);
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (proxy/utils/UUPSUpgradeable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../interfaces/draft-IERC1822Upgradeable.sol";
+import "../ERC1967/ERC1967UpgradeUpgradeable.sol";
+import "./Initializable.sol";
+
+/**
+ * @dev An upgradeability mechanism designed for UUPS proxies. The functions included here can perform an upgrade of an
+ * {ERC1967Proxy}, when this contract is set as the implementation behind such a proxy.
+ *
+ * A security mechanism ensures that an upgrade does not turn off upgradeability accidentally, although this risk is
+ * reinstated if the upgrade retains upgradeability but removes the security mechanism, e.g. by replacing
+ * `UUPSUpgradeable` with a custom implementation of upgrades.
+ *
+ * The {_authorizeUpgrade} function must be overridden to include access restriction to the upgrade mechanism.
+ *
+ * _Available since v4.1._
+ */
+abstract contract UUPSUpgradeable is Initializable, IERC1822ProxiableUpgradeable, ERC1967UpgradeUpgradeable {
+    function __UUPSUpgradeable_init() internal onlyInitializing {
+    }
+
+    function __UUPSUpgradeable_init_unchained() internal onlyInitializing {
+    }
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable state-variable-assignment
+    address private immutable __self = address(this);
+
+    /**
+     * @dev Check that the execution is being performed through a delegatecall call and that the execution context is
+     * a proxy contract with an implementation (as defined in ERC1967) pointing to self. This should only be the case
+     * for UUPS and transparent proxies that are using the current contract as their implementation. Execution of a
+     * function through ERC1167 minimal proxies (clones) would not normally pass this test, but is not guaranteed to
+     * fail.
+     */
+    modifier onlyProxy() {
+        require(address(this) != __self, "Function must be called through delegatecall");
+        require(_getImplementation() == __self, "Function must be called through active proxy");
+        _;
+    }
+
+    /**
+     * @dev Check that the execution is not being performed through a delegate call. This allows a function to be
+     * callable on the implementing contract but not through proxies.
+     */
+    modifier notDelegated() {
+        require(address(this) == __self, "UUPSUpgradeable: must not be called through delegatecall");
+        _;
+    }
+
+    /**
+     * @dev Implementation of the ERC1822 {proxiableUUID} function. This returns the storage slot used by the
+     * implementation. It is used to validate that the this implementation remains valid after an upgrade.
+     *
+     * IMPORTANT: A proxy pointing at a proxiable contract should not be considered proxiable itself, because this risks
+     * bricking a proxy that upgrades to it, by delegating to itself until out of gas. Thus it is critical that this
+     * function revert if invoked through a proxy. This is guaranteed by the `notDelegated` modifier.
+     */
+    function proxiableUUID() external view virtual override notDelegated returns (bytes32) {
+        return _IMPLEMENTATION_SLOT;
+    }
+
+    /**
+     * @dev Upgrade the implementation of the proxy to `newImplementation`.
+     *
+     * Calls {_authorizeUpgrade}.
+     *
+     * Emits an {Upgraded} event.
+     */
+    function upgradeTo(address newImplementation) external virtual onlyProxy {
+        _authorizeUpgrade(newImplementation);
+        _upgradeToAndCallUUPS(newImplementation, new bytes(0), false);
+    }
+
+    /**
+     * @dev Upgrade the implementation of the proxy to `newImplementation`, and subsequently execute the function call
+     * encoded in `data`.
+     *
+     * Calls {_authorizeUpgrade}.
+     *
+     * Emits an {Upgraded} event.
+     */
+    function upgradeToAndCall(address newImplementation, bytes memory data) external payable virtual onlyProxy {
+        _authorizeUpgrade(newImplementation);
+        _upgradeToAndCallUUPS(newImplementation, data, true);
+    }
+
+    /**
+     * @dev Function that should revert when `msg.sender` is not authorized to upgrade the contract. Called by
+     * {upgradeTo} and {upgradeToAndCall}.
+     *
+     * Normally, this function will use an xref:access.adoc[access control] modifier such as {Ownable-onlyOwner}.
+     *
+     * ```solidity
+     * function _authorizeUpgrade(address) internal override onlyOwner {}
+     * ```
+     */
+    function _authorizeUpgrade(address newImplementation) internal virtual;
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC20/utils/SafeERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20Upgradeable.sol";
+import "../extensions/draft-IERC20PermitUpgradeable.sol";
+import "../../../utils/AddressUpgradeable.sol";
+
+/**
+ * @title SafeERC20
+ * @dev Wrappers around ERC20 operations that throw on failure (when the token
+ * contract returns false). Tokens that return no value (and instead revert or
+ * throw on failure) are also supported, non-reverting calls are assumed to be
+ * successful.
+ * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,
+ * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.
+ */
+library SafeERC20Upgradeable {
+    using AddressUpgradeable for address;
+
+    function safeTransfer(
+        IERC20Upgradeable token,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
+
+    function safeTransferFrom(
+        IERC20Upgradeable token,
+        address from,
+        address to,
+        uint256 value
+    ) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+    }
+
+    /**
+     * @dev Deprecated. This function has issues similar to the ones found in
+     * {IERC20-approve}, and its usage is discouraged.
+     *
+     * Whenever possible, use {safeIncreaseAllowance} and
+     * {safeDecreaseAllowance} instead.
+     */
+    function safeApprove(
+        IERC20Upgradeable token,
+        address spender,
+        uint256 value
+    ) internal {
+        // safeApprove should only be called when setting an initial allowance,
+        // or when resetting it to zero. To increase and decrease it, use
+        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'
+        require(
+            (value == 0) || (token.allowance(address(this), spender) == 0),
+            "SafeERC20: approve from non-zero to non-zero allowance"
+        );
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    function safeIncreaseAllowance(
+        IERC20Upgradeable token,
+        address spender,
+        uint256 value
+    ) internal {
+        uint256 newAllowance = token.allowance(address(this), spender) + value;
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+    }
+
+    function safeDecreaseAllowance(
+        IERC20Upgradeable token,
+        address spender,
+        uint256 value
+    ) internal {
+        unchecked {
+            uint256 oldAllowance = token.allowance(address(this), spender);
+            require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+            uint256 newAllowance = oldAllowance - value;
+            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+        }
+    }
+
+    function safePermit(
+        IERC20PermitUpgradeable token,
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal {
+        uint256 nonceBefore = token.nonces(owner);
+        token.permit(owner, spender, value, deadline, v, r, s);
+        uint256 nonceAfter = token.nonces(owner);
+        require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+    }
+
+    /**
+     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement
+     * on the return value: the return value is optional (but if data is returned, it must not be false).
+     * @param token The token targeted by the call.
+     * @param data The call data (encoded using abi.encode or one of its variants).
+     */
+    function _callOptionalReturn(IERC20Upgradeable token, bytes memory data) private {
+        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since
+        // we're implementing it ourselves. We use {Address.functionCall} to perform this call, which verifies that
+        // the target address contains contract code and also asserts for success in the low-level call.
+
+        bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+        if (returndata.length > 0) {
+            // Return data is optional
+            require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20Upgradeable {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.3;
+
+contract Date {
+    /*
+     *  Date and Time utilities for ethereum contracts
+     *
+     */
+    struct _DateTime {
+        uint16 year;
+        uint8 month;
+        uint8 day;
+        uint8 hour;
+        uint8 minute;
+        uint8 second;
+        uint8 weekday;
+    }
+
+    uint constant DAY_IN_SECONDS = 86400;
+    uint constant YEAR_IN_SECONDS = 31536000;
+    uint constant LEAP_YEAR_IN_SECONDS = 31622400;
+
+    uint constant HOUR_IN_SECONDS = 3600;
+    uint constant MINUTE_IN_SECONDS = 60;
+
+    uint16 constant ORIGIN_YEAR = 1970;
+
+    function isLeapYear(uint16 year) internal pure returns (bool) {
+        if (year % 4 != 0) {
+            return false;
+        }
+        if (year % 100 != 0) {
+            return true;
+        }
+        if (year % 400 != 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    function leapYearsBefore(uint year) internal pure returns (uint) {
+        year -= 1;
+
+        return year / 4 - year / 100 + year / 400;
+    }
+
+    function getDaysInMonth(uint8 month, uint16 year) internal pure returns (uint8) {
+        if (month == 1 || month == 3 || month == 5 || month == 7 || month == 8 || month == 10 || month == 12) {
+            return 31;
+        }
+        else if (month == 4 || month == 6 || month == 9 || month == 11) {
+            return 30;
+        }
+        else if (isLeapYear(year)) {
+            return 29;
+        }
+        else {
+            return 28;
+        }
+    }
+
+    function parseTimestamp(uint timestamp) internal pure returns (_DateTime memory dt) {
+        uint secondsAccountedFor = 0;
+        uint buf;
+        uint8 i;
+
+        // Year
+        dt.year = getYear(timestamp);
+        buf = leapYearsBefore(dt.year) - leapYearsBefore(ORIGIN_YEAR);
+
+        secondsAccountedFor += LEAP_YEAR_IN_SECONDS * buf;
+        secondsAccountedFor += YEAR_IN_SECONDS * (dt.year - ORIGIN_YEAR - buf);
+
+        // Month
+        uint secondsInMonth;
+
+        for (i = 1; i <= 12; i++) {
+            secondsInMonth = DAY_IN_SECONDS * getDaysInMonth(i, dt.year);
+
+            if (secondsInMonth + secondsAccountedFor > timestamp) {
+                dt.month = i;
+                break;
+            }
+
+            secondsAccountedFor += secondsInMonth;
+        }
+
+        // Day
+        for (i = 1; i <= getDaysInMonth(dt.month, dt.year); i++) {
+            if (DAY_IN_SECONDS + secondsAccountedFor > timestamp) {
+                dt.day = i;
+                break;
+            }
+
+            secondsAccountedFor += DAY_IN_SECONDS;
+        }
+
+        // Hour
+        dt.hour = getHour(timestamp);
+
+        // Minute
+        dt.minute = getMinute(timestamp);
+
+        // Second
+        dt.second = getSecond(timestamp);
+
+        // Day of week.
+        dt.weekday = getWeekday(timestamp);
+
+        return dt;
+    }
+
+    function getYear(uint timestamp) internal pure returns (uint16) {
+        uint secondsAccountedFor = 0;
+        uint16 year;
+        uint numLeapYears;
+
+        // Year
+        year = uint16(ORIGIN_YEAR + timestamp / YEAR_IN_SECONDS);
+        numLeapYears = leapYearsBefore(year) - leapYearsBefore(ORIGIN_YEAR);
+
+        secondsAccountedFor += LEAP_YEAR_IN_SECONDS * numLeapYears;
+        secondsAccountedFor += YEAR_IN_SECONDS * (year - ORIGIN_YEAR - numLeapYears);
+
+        while (secondsAccountedFor > timestamp) {
+            if (isLeapYear(uint16(year - 1))) {
+                secondsAccountedFor -= LEAP_YEAR_IN_SECONDS;
+            }
+            else {
+                secondsAccountedFor -= YEAR_IN_SECONDS;
+            }
+            year -= 1;
+        }
+
+        return year;
+    }
+
+    function getMonth(uint timestamp) internal pure returns (uint8) {
+        return parseTimestamp(timestamp).month;
+    }
+
+    function getDay(uint timestamp) internal pure returns (uint8) {
+        return parseTimestamp(timestamp).day;
+    }
+
+    function getHour(uint timestamp) internal pure returns (uint8) {
+        return uint8((timestamp / 60 / 60) % 24);
+    }
+
+    function getMinute(uint timestamp) internal pure returns (uint8) {
+        return uint8((timestamp / 60) % 60);
+    }
+
+    function getSecond(uint timestamp) internal pure returns (uint8) {
+        return uint8(timestamp % 60);
+    }
+
+    function getWeekday(uint timestamp) internal pure returns (uint8) {
+        return uint8((timestamp / DAY_IN_SECONDS + 4) % 7);
+    }
+
+    function toTimestamp(uint16 year, uint8 month, uint8 day, uint8 hour, uint8 minute, uint8 second) internal pure returns (uint timestamp) {
+        uint16 i;
+
+        // Year
+        for (i = ORIGIN_YEAR; i < year; i++) {
+            if (isLeapYear(i)) {
+                timestamp += LEAP_YEAR_IN_SECONDS;
+            }
+            else {
+                timestamp += YEAR_IN_SECONDS;
+            }
+        }
+
+        // Month
+        uint8[12] memory monthDayCounts;
+        monthDayCounts[0] = 31;
+        if (isLeapYear(year)) {
+            monthDayCounts[1] = 29;
+        }
+        else {
+            monthDayCounts[1] = 28;
+        }
+        monthDayCounts[2] = 31;
+        monthDayCounts[3] = 30;
+        monthDayCounts[4] = 31;
+        monthDayCounts[5] = 30;
+        monthDayCounts[6] = 31;
+        monthDayCounts[7] = 31;
+        monthDayCounts[8] = 30;
+        monthDayCounts[9] = 31;
+        monthDayCounts[10] = 30;
+        monthDayCounts[11] = 31;
+
+        for (i = 1; i < month; i++) {
+            timestamp += DAY_IN_SECONDS * monthDayCounts[i - 1];
+        }
+
+        // Day
+        timestamp += DAY_IN_SECONDS * (day - 1);
+
+        // Hour
+        timestamp += HOUR_IN_SECONDS * (hour);
+
+        // Minute
+        timestamp += MINUTE_IN_SECONDS * (minute);
+
+        // Second
+        timestamp += second;
+
+        return timestamp;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../../interfaces/ILifeSpan.sol";
+
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721BurnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
+
+import "@openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/Base64Upgradeable.sol";
+
+/// @custom:security-contact [email protected]
+contract LifeSpan is
+    ILifeSpan,
+    Initializable,
+    ERC721Upgradeable,
+    ERC721EnumerableUpgradeable,
+    PausableUpgradeable,
+    AccessControlUpgradeable,
+    ERC721BurnableUpgradeable,
+    UUPSUpgradeable
+{
+    using CountersUpgradeable for CountersUpgradeable.Counter;
+    using StringsUpgradeable for uint256;
+
+    CountersUpgradeable.Counter private _tokenIdCounter;
+
+    mapping(uint256 => TokenData) public tokenData;
+    mapping(uint256 => Gender) private genders;
+
+    string externalURL;
+    string renderImageURL;
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        string memory _externalURL,
+        string memory _renderImageURL
+    ) public initializer {
+        __ERC721_init("LifeSpan", "LIFESPAN");
+        __ERC721Enumerable_init();
+        __Pausable_init();
+        __AccessControl_init();
+        __ERC721Burnable_init();
+        __UUPSUpgradeable_init();
+
+        externalURL = _externalURL;
+        renderImageURL = _renderImageURL;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /// @notice Pause contract
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause contract
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Safe mint of LifeSpan token
+     * @param _to the address of the token recipient
+     * @param _name of LifeSpan token
+     * @param _gender id of LifeSpan token
+     * @param _birthdayDate date of birth of the token owner in the timestamp
+     */
+    function safeMint(
+        address _to,
+        string memory _name,
+        uint256 _gender,
+        uint256 _birthdayDate
+    ) public onlyRole(MINTER_ROLE) whenNotPaused {
+        require(
+            bytes(genders[_gender].name).length != 0,
+            "ERC721Metadata: Gender doesn't exist"
+        );
+        require(
+            genders[_gender].isActive,
+            "ERC721Metadata: Gender isn't active"
+        );
+        require(
+            _birthdayDate < block.timestamp,
+            "ERC721Metadata: Invalid date"
+        );
+
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(_to, tokenId);
+        tokenData[tokenId] = TokenData(
+            _name,
+            _gender,
+            _birthdayDate,
+            0,
+            block.timestamp
+        );
+    }
+
+    /**
+     * @notice Get information about the token in JSON
+     * @param _tokenId id LifeSpan token
+     * @return base64(JSON) data of LifeSpan
+     */
+    function tokenURI(uint256 _tokenId)
+        public
+        view
+        override
+        returns (string memory)
+    {
+        require(_exists(_tokenId), "ERC721Metadata: The token doesn't exist");
+
+        bytes memory data = abi.encodePacked(
+            baseSection(_tokenId),
+            attributesSection(_tokenId)
+        );
+        return
+            string(
+                abi.encodePacked(
+                    "data:application/json;base64,",
+                    Base64Upgradeable.encode(data)
+                )
+            );
+    }
+
+    /**
+     * @notice Change the name in the token
+     * @param _tokenId id LifeSpan token
+     * @param _newName new name of the token owner
+     */
+    function updateTokenName(uint256 _tokenId, string memory _newName)
+        external
+        whenNotPaused
+    {
+        require(_exists(_tokenId), "ERC721Metadata: The token doesn't exist");
+        require(
+            ownerOf(_tokenId) == msg.sender,
+            "ERC721: You aren't the token owner"
+        );
+
+        tokenData[_tokenId].name = _newName;
+    }
+
+    /**
+     * @notice Change the gender in the token
+     * @param _tokenId id LifeSpan token
+     * @param _newGender id new gender of the token owner
+     */
+    function updateTokenGender(uint256 _tokenId, uint256 _newGender)
+        external
+        whenNotPaused
+    {
+        require(_exists(_tokenId), "ERC721Metadata: The token doesn't exist");
+        require(
+            ownerOf(_tokenId) == msg.sender,
+            "ERC721: You aren't the token owner"
+        );
+        require(
+            bytes(genders[_newGender].name).length != 0,
+            "ERC721Metadata: Gender doesn't exist"
+        );
+        require(
+            genders[_newGender].isActive,
+            "ERC721Metadata: Gender isn't active"
+        );
+
+        tokenData[_tokenId].gender = _newGender;
+    }
+
+    /**
+     * @notice Add a new gender to the list of available
+     * @param _id of new gender
+     * @param _newGender name of new gender
+     */
+    function addGender(uint256 _id, string memory _newGender)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+    {
+        require(
+            bytes(genders[_id].name).length == 0,
+            "ERC721Metadata: Gender already exists"
+        );
+
+        genders[_id].name = _newGender;
+        genders[_id].isActive = true;
+    }
+
+    /**
+     * @notice Enable or disable gender from the list of available to choose
+     * @param _id of gender
+     * @param _status true or false
+     */
+    function setIsActiveGender(uint256 _id, bool _status)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+    {
+        require(
+            bytes(genders[_id].name).length != 0,
+            "ERC721Metadata: Gender doesn't exist"
+        );
+
+        genders[_id].isActive = _status;
+    }
+
+    /**
+     * @notice Update external URL of LifeSpan token's
+     * @param _newExternalURL string of new URL
+     */
+    function updateExternalURL(string memory _newExternalURL)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+    {
+        externalURL = _newExternalURL;
+    }
+
+    /**
+     * @notice Update the URL to the token renderer
+     * @param _newRenderImageURL string of new URL
+     */
+    function updateRenderImageURL(string memory _newRenderImageURL)
+        external
+        onlyRole(OPERATOR_ROLE)
+        whenNotPaused
+    {
+        renderImageURL = _newRenderImageURL;
+    }
+
+    /**
+     * @notice Get information about birthday date user token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 birthday date
+     */
+    function getBirthdayDate(uint256 _tokenId)
+    public
+    view
+    override
+    returns (uint256)
+    {
+        return tokenData[_tokenId].birthdayDate;
+    }
+
+    /**
+     * @notice Get information about date of mint token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 date of mint
+     */
+    function getDateOfMint(uint256 _tokenId)
+    public
+    view
+    override
+    returns (uint256)
+    {
+        return tokenData[_tokenId].dateOfMint;
+    }
+
+    /**
+     * @notice Get information about death date user token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 death date
+     */
+    function getDeathDate(uint256 _tokenId)
+    public
+    view
+    override
+    returns (uint256)
+    {
+        return tokenData[_tokenId].deathDate;
+    }
+
+    /**
+     * @notice Get base section of LifeSpan token in JSON
+     * @param _tokenId id LifeSpan token
+     * @return bytes(JSON) of base section
+     */
+    function baseSection(uint256 _tokenId) private view returns (bytes memory) {
+        return
+            abi.encodePacked(
+                "{",
+                '"description":"Plush ecosystem avatar",',
+                '"external_url": "',
+                externalURL,
+                _tokenId.toString(),
+                '",',
+                '"name": "',
+                tokenData[_tokenId].name,
+                "'s Plush Token",
+                '",',
+                '"image":"',
+                renderImageURL,
+                "?birthdayDate=",
+                tokenData[_tokenId].birthdayDate.toString(),
+                "&name=",
+                tokenData[_tokenId].name,
+                "&gender=",
+                tokenData[_tokenId].gender.toString(),
+                '",'
+            );
+    }
+
+    /**
+     * @notice Get attributes of LifeSpan token in JSON
+     * @param _tokenId id LifeSpan token
+     * @return bytes(JSON) of attributes
+     */
+    function attributesSection(uint256 _tokenId)
+        private
+        view
+        returns (bytes memory)
+    {
+        return
+            abi.encodePacked(
+                '"attributes":',
+                "[{",
+                '"display_type":"date","trait_type":"Birthday","value":',
+                tokenData[_tokenId].birthdayDate.toString(),
+                "",
+                "},{",
+                '"display_type":"date","trait_type":"Date of Mint","value":',
+                tokenData[_tokenId].dateOfMint.toString(),
+                "",
+                "},{",
+                '"trait_type":"Gender","value":"',
+                genders[tokenData[_tokenId].gender].name,
+                '"',
+                "}]",
+                "}"
+            );
+    }
+
+    function _beforeTokenTransfer(
+        address _from,
+        address _to,
+        uint256 _tokenId
+    )
+        internal
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+        whenNotPaused
+    {
+        super._beforeTokenTransfer(_from, _to, _tokenId);
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(
+            ERC721Upgradeable,
+            ERC721EnumerableUpgradeable,
+            AccessControlUpgradeable
+        )
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../interfaces/IPlushAccounts.sol";
+import "../interfaces/IPlushApps.sol";
+
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+contract PlushAccounts is
+    IPlushAccounts,
+    Initializable,
+    PausableUpgradeable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    IERC20Upgradeable public plush;
+    IPlushApps public plushApps;
+
+    address public plushFeeAddress;
+
+    mapping(address => Account) public accounts;
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        IERC20Upgradeable _plush,
+        IPlushApps _plushApps,
+        address _plushFeeAddress
+    ) public initializer {
+        plushApps = _plushApps;
+        plush = _plush;
+        plushFeeAddress = _plushFeeAddress;
+
+        __Pausable_init();
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /// @notice Pause contract
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause contract
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Deposit tokens to the account
+     * @param account address
+     * @param amount the amount to be deposited in tokens
+     */
+    function deposit(address account, uint256 amount) public {
+        if (plushApps.getAppExists(account) == true) {
+            require(
+                plushApps.getAppStatus(account),
+                "The controller isn't active"
+            );
+        }
+
+        require(amount > 0, "The deposit amount cannot be zero");
+
+        accounts[account].balance += amount;
+
+        plush.safeTransferFrom(msg.sender, address(this), amount);
+
+        emit Deposited(msg.sender, account, amount);
+    }
+
+    /**
+     * @notice Withdraw ERC-20 tokens from user account to the current wallet address
+     * @param amount the amount of tokens being withdrawn
+     */
+    function withdraw(uint256 amount) external {
+        require(accounts[msg.sender].balance >= amount, "Insufficient funds");
+        require(
+            plushApps.getAppExists(msg.sender) == false,
+            "The wallet is a controller"
+        );
+
+        accounts[msg.sender].balance -= amount;
+
+        plush.safeTransfer(msg.sender, amount);
+
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    /**
+     * @notice Withdrawal of tokens by the controller from his account to available withdrawal addresses
+     * @param account withdraw address
+     * @param amount the amount of tokens being withdrawn
+     */
+    function withdrawByController(address account, uint256 amount) external {
+        require(accounts[msg.sender].balance >= amount, "Insufficient funds");
+        require(
+            plushApps.getAppStatus(msg.sender),
+            "The controller isn't active"
+        );
+
+        accounts[msg.sender].balance -= amount;
+
+        plush.safeTransfer(account, amount);
+
+        emit ControllerWithdrawn(msg.sender, account, amount);
+    }
+
+    /**
+     * @notice Transfer of tokens between accounts inside PlushAccounts
+     * @param account receiver address
+     * @param amount transfer amount
+     */
+    function internalTransfer(address account, uint256 amount) external {
+        if (plushApps.getAppExists(msg.sender) == true) {
+            require(
+                plushApps.getAppStatus(msg.sender),
+                "The controller isn't active"
+            );
+        }
+
+        require(accounts[msg.sender].balance >= amount, "Insufficient funds");
+
+        accounts[msg.sender].balance -= amount;
+        accounts[account].balance += amount;
+
+        emit Transferred(msg.sender, account, amount);
+    }
+
+    /**
+     * @notice Debiting user tokens by the controller
+     * @param account user account
+     * @param amount amount of tokens debited
+     */
+    function decreaseAccountBalance(address account, uint256 amount) public {
+        require(accounts[account].balance >= amount, "Insufficient funds");
+        require(
+            plushApps.getAppStatus(msg.sender),
+            "The controller isn't active"
+        );
+
+        uint256 percent = (amount * plushApps.getFeeApp(msg.sender)) / 100000; // Plush fee
+
+        accounts[account].balance -= amount;
+        accounts[msg.sender].balance += amount - percent;
+        accounts[plushFeeAddress].balance += percent;
+
+        emit Debited(msg.sender, account, amount);
+    }
+
+    /**
+     * @notice Return Plush Fee account balance
+     * @return account balance in wei
+     */
+    function getPlushFeeAccountBalance() public view returns (uint256) {
+        return accounts[plushFeeAddress].balance;
+    }
+
+    /**
+     * @notice Check account balance
+     * @param account requesting account
+     * @return account balance in wei
+     */
+    function getAccountBalance(address account)
+        external
+        view
+        returns (uint256)
+    {
+        return accounts[account].balance;
+    }
+
+    /**
+     * @notice Set Plush fee address
+     * @param account fee address
+     */
+    function setPlushFeeAddress(address account)
+        external
+        onlyRole(OPERATOR_ROLE)
+    {
+        plushFeeAddress = account;
+    }
+
+    /**
+     * @notice Get Plush fee address
+     * @return address
+     */
+    function getPlushFeeAddress() public view returns (address) {
+        return plushFeeAddress;
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../interfaces/IPlushBlacklist.sol";
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+/// @custom:security-contact [email protected]
+contract PlushBlacklist is
+    IPlushBlacklist,
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    mapping(address => bool) public blacklisted;
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() public initializer {
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Checks if account is blacklisted
+     * @param _account The address to check
+     */
+    function isBlacklisted(address _account) public view returns (bool) {
+        return blacklisted[_account];
+    }
+
+    /**
+     * @notice Adds account to blacklist
+     * @param _account The address to blacklist
+     */
+    function blacklist(address _account) external onlyRole(OPERATOR_ROLE) {
+        blacklisted[_account] = true;
+        emit Blacklisted(_account);
+    }
+
+    /**
+     * @notice Removes account from blacklist
+     * @param _account The address to remove from the blacklist
+     */
+    function unBlacklist(address _account) external onlyRole(OPERATOR_ROLE) {
+        blacklisted[_account] = false;
+        emit UnBlacklisted(_account);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract ContextUpgradeable is Initializable {
+    function __Context_init() internal onlyInitializing {
+    }
+
+    function __Context_init_unchained() internal onlyInitializing {
+    }
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Address.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library AddressUpgradeable {
+    /**
+     * @dev Returns true if `account` is a contract.
+     *
+     * [IMPORTANT]
+     * ====
+     * It is unsafe to assume that an address for which this function returns
+     * false is an externally-owned account (EOA) and not a contract.
+     *
+     * Among others, `isContract` will return false for the following
+     * types of addresses:
+     *
+     *  - an externally-owned account
+     *  - a contract in construction
+     *  - an address where a contract will be created
+     *  - an address where a contract lived, but was destroyed
+     * ====
+     *
+     * [IMPORTANT]
+     * ====
+     * You shouldn't rely on `isContract` to protect against flash loan attacks!
+     *
+     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets
+     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract
+     * constructor.
+     * ====
+     */
+    function isContract(address account) internal view returns (bool) {
+        // This method relies on extcodesize/address.code.length, which returns 0
+        // for contracts in construction, since the code is only stored at the end
+        // of the constructor execution.
+
+        return account.code.length > 0;
+    }
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason, it is bubbled up by this
+     * function (like regular Solidity function calls).
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCall(target, data, "Address: low-level call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with
+     * `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value
+    ) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but
+     * with `errorMessage` as a fallback revert reason when `target` reverts.
+     *
+     * _Available since v3.1._
+     */
+    function functionCallWithValue(
+        address target,
+        bytes memory data,
+        uint256 value,
+        string memory errorMessage
+    ) internal returns (bytes memory) {
+        require(address(this).balance >= value, "Address: insufficient balance for call");
+        require(isContract(target), "Address: call to non-contract");
+
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        return functionStaticCall(target, data, "Address: low-level static call failed");
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a static call.
+     *
+     * _Available since v3.3._
+     */
+    function functionStaticCall(
+        address target,
+        bytes memory data,
+        string memory errorMessage
+    ) internal view returns (bytes memory) {
+        require(isContract(target), "Address: static call to non-contract");
+
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResult(success, returndata, errorMessage);
+    }
+
+    /**
+     * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the
+     * revert reason using the provided one.
+     *
+     * _Available since v4.3._
+     */
+    function verifyCallResult(
+        bool success,
+        bytes memory returndata,
+        string memory errorMessage
+    ) internal pure returns (bytes memory) {
+        if (success) {
+            return returndata;
+        } else {
+            // Look for revert reason and bubble it up if present
+            if (returndata.length > 0) {
+                // The easiest way to bubble the revert reason is using memory via assembly
+                /// @solidity memory-safe-assembly
+                assembly {
+                    let returndata_size := mload(returndata)
+                    revert(add(32, returndata), returndata_size)
+                }
+            } else {
+                revert(errorMessage);
+            }
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev External interface of AccessControl declared to support ERC165 detection.
+ */
+interface IAccessControlUpgradeable {
+    /**
+     * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`
+     *
+     * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite
+     * {RoleAdminChanged} not being emitted signaling this.
+     *
+     * _Available since v3.1._
+     */
+    event RoleAdminChanged(bytes32 indexed role, bytes32 indexed previousAdminRole, bytes32 indexed newAdminRole);
+
+    /**
+     * @dev Emitted when `account` is granted `role`.
+     *
+     * `sender` is the account that originated the contract call, an admin role
+     * bearer except when using {AccessControl-_setupRole}.
+     */
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Emitted when `account` is revoked `role`.
+     *
+     * `sender` is the account that originated the contract call:
+     *   - if using `revokeRole`, it is the admin role bearer
+     *   - if using `renounceRole`, it is the role bearer (i.e. `account`)
+     */
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+
+    /**
+     * @dev Returns `true` if `account` has been granted `role`.
+     */
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    /**
+     * @dev Returns the admin role that controls `role`. See {grantRole} and
+     * {revokeRole}.
+     *
+     * To change a role's admin, use {AccessControl-_setRoleAdmin}.
+     */
+    function getRoleAdmin(bytes32 role) external view returns (bytes32);
+
+    /**
+     * @dev Grants `role` to `account`.
+     *
+     * If `account` had not been already granted `role`, emits a {RoleGranted}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function grantRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from `account`.
+     *
+     * If `account` had been granted `role`, emits a {RoleRevoked} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have ``role``'s admin role.
+     */
+    function revokeRole(bytes32 role, address account) external;
+
+    /**
+     * @dev Revokes `role` from the calling account.
+     *
+     * Roles are often managed via {grantRole} and {revokeRole}: this function's
+     * purpose is to provide a mechanism for accounts to lose their privileges
+     * if they are compromised (such as when a trusted device is misplaced).
+     *
+     * If the calling account had been granted `role`, emits a {RoleRevoked}
+     * event.
+     *
+     * Requirements:
+     *
+     * - the caller must be `account`.
+     */
+    function renounceRole(bytes32 role, address account) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Strings.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev String operations.
+ */
+library StringsUpgradeable {
+    bytes16 private constant _HEX_SYMBOLS = "0123456789abcdef";
+    uint8 private constant _ADDRESS_LENGTH = 20;
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` decimal representation.
+     */
+    function toString(uint256 value) internal pure returns (string memory) {
+        // Inspired by OraclizeAPI's implementation - MIT licence
+        // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol
+
+        if (value == 0) {
+            return "0";
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.
+     */
+    function toHexString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0x00";
+        }
+        uint256 temp = value;
+        uint256 length = 0;
+        while (temp != 0) {
+            length++;
+            temp >>= 8;
+        }
+        return toHexString(value, length);
+    }
+
+    /**
+     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.
+     */
+    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {
+        bytes memory buffer = new bytes(2 * length + 2);
+        buffer[0] = "0";
+        buffer[1] = "x";
+        for (uint256 i = 2 * length + 1; i > 1; --i) {
+            buffer[i] = _HEX_SYMBOLS[value & 0xf];
+            value >>= 4;
+        }
+        require(value == 0, "Strings: hex length insufficient");
+        return string(buffer);
+    }
+
+    /**
+     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.
+     */
+    function toHexString(address addr) internal pure returns (string memory) {
+        return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC165Upgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Implementation of the {IERC165} interface.
+ *
+ * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check
+ * for the additional interface id that will be supported. For example:
+ *
+ * ```solidity
+ * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+ *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);
+ * }
+ * ```
+ *
+ * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.
+ */
+abstract contract ERC165Upgradeable is Initializable, IERC165Upgradeable {
+    function __ERC165_init() internal onlyInitializing {
+    }
+
+    function __ERC165_init_unchained() internal onlyInitializing {
+    }
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == type(IERC165Upgradeable).interfaceId;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC165 standard, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-165[EIP].
+ *
+ * Implementers can declare support of contract interfaces, which can then be
+ * queried by others ({ERC165Checker}).
+ *
+ * For an implementation, see {ERC165}.
+ */
+interface IERC165Upgradeable {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (interfaces/draft-IERC1822.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev ERC1822: Universal Upgradeable Proxy Standard (UUPS) documents a method for upgradeability through a simplified
+ * proxy whose upgrades are fully controlled by the current implementation.
+ */
+interface IERC1822ProxiableUpgradeable {
+    /**
+     * @dev Returns the storage slot that the proxiable contract assumes is being used to store the implementation
+     * address.
+     *
+     * IMPORTANT: A proxy pointing at a proxiable contract should not be considered proxiable itself, because this risks
+     * bricking a proxy that upgrades to it, by delegating to itself until out of gas. Thus it is critical that this
+     * function revert if invoked through a proxy.
+     */
+    function proxiableUUID() external view returns (bytes32);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (proxy/ERC1967/ERC1967Upgrade.sol)
+
+pragma solidity ^0.8.2;
+
+import "../beacon/IBeaconUpgradeable.sol";
+import "../../interfaces/draft-IERC1822Upgradeable.sol";
+import "../../utils/AddressUpgradeable.sol";
+import "../../utils/StorageSlotUpgradeable.sol";
+import "../utils/Initializable.sol";
+
+/**
+ * @dev This abstract contract provides getters and event emitting update functions for
+ * https://eips.ethereum.org/EIPS/eip-1967[EIP1967] slots.
+ *
+ * _Available since v4.1._
+ *
+ * @custom:oz-upgrades-unsafe-allow delegatecall
+ */
+abstract contract ERC1967UpgradeUpgradeable is Initializable {
+    function __ERC1967Upgrade_init() internal onlyInitializing {
+    }
+
+    function __ERC1967Upgrade_init_unchained() internal onlyInitializing {
+    }
+    // This is the keccak-256 hash of "eip1967.proxy.rollback" subtracted by 1
+    bytes32 private constant _ROLLBACK_SLOT = 0x4910fdfa16fed3260ed0e7147f7cc6da11a60208b5b9406d12a635614ffd9143;
+
+    /**
+     * @dev Storage slot with the address of the current implementation.
+     * This is the keccak-256 hash of "eip1967.proxy.implementation" subtracted by 1, and is
+     * validated in the constructor.
+     */
+    bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+    /**
+     * @dev Emitted when the implementation is upgraded.
+     */
+    event Upgraded(address indexed implementation);
+
+    /**
+     * @dev Returns the current implementation address.
+     */
+    function _getImplementation() internal view returns (address) {
+        return StorageSlotUpgradeable.getAddressSlot(_IMPLEMENTATION_SLOT).value;
+    }
+
+    /**
+     * @dev Stores a new address in the EIP1967 implementation slot.
+     */
+    function _setImplementation(address newImplementation) private {
+        require(AddressUpgradeable.isContract(newImplementation), "ERC1967: new implementation is not a contract");
+        StorageSlotUpgradeable.getAddressSlot(_IMPLEMENTATION_SLOT).value = newImplementation;
+    }
+
+    /**
+     * @dev Perform implementation upgrade
+     *
+     * Emits an {Upgraded} event.
+     */
+    function _upgradeTo(address newImplementation) internal {
+        _setImplementation(newImplementation);
+        emit Upgraded(newImplementation);
+    }
+
+    /**
+     * @dev Perform implementation upgrade with additional setup call.
+     *
+     * Emits an {Upgraded} event.
+     */
+    function _upgradeToAndCall(
+        address newImplementation,
+        bytes memory data,
+        bool forceCall
+    ) internal {
+        _upgradeTo(newImplementation);
+        if (data.length > 0 || forceCall) {
+            _functionDelegateCall(newImplementation, data);
+        }
+    }
+
+    /**
+     * @dev Perform implementation upgrade with security checks for UUPS proxies, and additional setup call.
+     *
+     * Emits an {Upgraded} event.
+     */
+    function _upgradeToAndCallUUPS(
+        address newImplementation,
+        bytes memory data,
+        bool forceCall
+    ) internal {
+        // Upgrades from old implementations will perform a rollback test. This test requires the new
+        // implementation to upgrade back to the old, non-ERC1822 compliant, implementation. Removing
+        // this special case will break upgrade paths from old UUPS implementation to new ones.
+        if (StorageSlotUpgradeable.getBooleanSlot(_ROLLBACK_SLOT).value) {
+            _setImplementation(newImplementation);
+        } else {
+            try IERC1822ProxiableUpgradeable(newImplementation).proxiableUUID() returns (bytes32 slot) {
+                require(slot == _IMPLEMENTATION_SLOT, "ERC1967Upgrade: unsupported proxiableUUID");
+            } catch {
+                revert("ERC1967Upgrade: new implementation is not UUPS");
+            }
+            _upgradeToAndCall(newImplementation, data, forceCall);
+        }
+    }
+
+    /**
+     * @dev Storage slot with the admin of the contract.
+     * This is the keccak-256 hash of "eip1967.proxy.admin" subtracted by 1, and is
+     * validated in the constructor.
+     */
+    bytes32 internal constant _ADMIN_SLOT = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103;
+
+    /**
+     * @dev Emitted when the admin account has changed.
+     */
+    event AdminChanged(address previousAdmin, address newAdmin);
+
+    /**
+     * @dev Returns the current admin.
+     */
+    function _getAdmin() internal view returns (address) {
+        return StorageSlotUpgradeable.getAddressSlot(_ADMIN_SLOT).value;
+    }
+
+    /**
+     * @dev Stores a new address in the EIP1967 admin slot.
+     */
+    function _setAdmin(address newAdmin) private {
+        require(newAdmin != address(0), "ERC1967: new admin is the zero address");
+        StorageSlotUpgradeable.getAddressSlot(_ADMIN_SLOT).value = newAdmin;
+    }
+
+    /**
+     * @dev Changes the admin of the proxy.
+     *
+     * Emits an {AdminChanged} event.
+     */
+    function _changeAdmin(address newAdmin) internal {
+        emit AdminChanged(_getAdmin(), newAdmin);
+        _setAdmin(newAdmin);
+    }
+
+    /**
+     * @dev The storage slot of the UpgradeableBeacon contract which defines the implementation for this proxy.
+     * This is bytes32(uint256(keccak256('eip1967.proxy.beacon')) - 1)) and is validated in the constructor.
+     */
+    bytes32 internal constant _BEACON_SLOT = 0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50;
+
+    /**
+     * @dev Emitted when the beacon is upgraded.
+     */
+    event BeaconUpgraded(address indexed beacon);
+
+    /**
+     * @dev Returns the current beacon.
+     */
+    function _getBeacon() internal view returns (address) {
+        return StorageSlotUpgradeable.getAddressSlot(_BEACON_SLOT).value;
+    }
+
+    /**
+     * @dev Stores a new beacon in the EIP1967 beacon slot.
+     */
+    function _setBeacon(address newBeacon) private {
+        require(AddressUpgradeable.isContract(newBeacon), "ERC1967: new beacon is not a contract");
+        require(
+            AddressUpgradeable.isContract(IBeaconUpgradeable(newBeacon).implementation()),
+            "ERC1967: beacon implementation is not a contract"
+        );
+        StorageSlotUpgradeable.getAddressSlot(_BEACON_SLOT).value = newBeacon;
+    }
+
+    /**
+     * @dev Perform beacon upgrade with additional setup call. Note: This upgrades the address of the beacon, it does
+     * not upgrade the implementation contained in the beacon (see {UpgradeableBeacon-_setImplementation} for that).
+     *
+     * Emits a {BeaconUpgraded} event.
+     */
+    function _upgradeBeaconToAndCall(
+        address newBeacon,
+        bytes memory data,
+        bool forceCall
+    ) internal {
+        _setBeacon(newBeacon);
+        emit BeaconUpgraded(newBeacon);
+        if (data.length > 0 || forceCall) {
+            _functionDelegateCall(IBeaconUpgradeable(newBeacon).implementation(), data);
+        }
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],
+     * but performing a delegate call.
+     *
+     * _Available since v3.4._
+     */
+    function _functionDelegateCall(address target, bytes memory data) private returns (bytes memory) {
+        require(AddressUpgradeable.isContract(target), "Address: delegate call to non-contract");
+
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return AddressUpgradeable.verifyCallResult(success, returndata, "Address: low-level delegate call failed");
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (proxy/beacon/IBeacon.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev This is the interface that {BeaconProxy} expects of its beacon.
+ */
+interface IBeaconUpgradeable {
+    /**
+     * @dev Must return an address that can be used as a delegate call target.
+     *
+     * {BeaconProxy} will check that this address is a contract.
+     */
+    function implementation() external view returns (address);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/StorageSlot.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Library for reading and writing primitive types to specific storage slots.
+ *
+ * Storage slots are often used to avoid storage conflict when dealing with upgradeable contracts.
+ * This library helps with reading and writing to such slots without the need for inline assembly.
+ *
+ * The functions in this library return Slot structs that contain a `value` member that can be used to read or write.
+ *
+ * Example usage to set ERC1967 implementation slot:
+ * ```
+ * contract ERC1967 {
+ *     bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+ *
+ *     function _getImplementation() internal view returns (address) {
+ *         return StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value;
+ *     }
+ *
+ *     function _setImplementation(address newImplementation) internal {
+ *         require(Address.isContract(newImplementation), "ERC1967: new implementation is not a contract");
+ *         StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value = newImplementation;
+ *     }
+ * }
+ * ```
+ *
+ * _Available since v4.1 for `address`, `bool`, `bytes32`, and `uint256`._
+ */
+library StorageSlotUpgradeable {
+    struct AddressSlot {
+        address value;
+    }
+
+    struct BooleanSlot {
+        bool value;
+    }
+
+    struct Bytes32Slot {
+        bytes32 value;
+    }
+
+    struct Uint256Slot {
+        uint256 value;
+    }
+
+    /**
+     * @dev Returns an `AddressSlot` with member `value` located at `slot`.
+     */
+    function getAddressSlot(bytes32 slot) internal pure returns (AddressSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `BooleanSlot` with member `value` located at `slot`.
+     */
+    function getBooleanSlot(bytes32 slot) internal pure returns (BooleanSlot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `Bytes32Slot` with member `value` located at `slot`.
+     */
+    function getBytes32Slot(bytes32 slot) internal pure returns (Bytes32Slot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+
+    /**
+     * @dev Returns an `Uint256Slot` with member `value` located at `slot`.
+     */
+    function getUint256Slot(bytes32 slot) internal pure returns (Uint256Slot storage r) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            r.slot := slot
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in
+ * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].
+ *
+ * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by
+ * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't
+ * need to send a transaction, and thus is not required to hold Ether at all.
+ */
+interface IERC20PermitUpgradeable {
+    /**
+     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,
+     * given ``owner``'s signed approval.
+     *
+     * IMPORTANT: The same issues {IERC20-approve} has related to transaction
+     * ordering also apply here.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `deadline` must be a timestamp in the future.
+     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`
+     * over the EIP712-formatted function arguments.
+     * - the signature must use ``owner``'s current nonce (see {nonces}).
+     *
+     * For more information on the signature format, see the
+     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP
+     * section].
+     */
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+
+    /**
+     * @dev Returns the current nonce for `owner`. This value must be
+     * included whenever a signature is generated for {permit}.
+     *
+     * Every successful call to {permit} increases ``owner``'s nonce by one. This
+     * prevents a signature from being used multiple times.
+     */
+    function nonces(address owner) external view returns (uint256);
+
+    /**
+     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface ILifeSpan {
+    struct TokenData {
+        string name;
+        uint256 gender;
+        uint256 birthdayDate;
+        uint256 deathDate;
+        uint256 dateOfMint;
+    }
+
+    struct Gender {
+        string name;
+        bool isActive;
+    }
+
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Safe mint LifeSpan token
+     * @param to wallet address to which the token is mint
+     * @param name of LifeSpan token
+     * @param gender id of LifeSpan token
+     * @param birthdayDate time in sec when the token(user) was born
+     */
+    function safeMint(
+        address to,
+        string memory name,
+        uint256 gender,
+        uint256 birthdayDate
+    ) external;
+
+    /**
+     * @notice Add new gender
+     * @param id of new gender
+     * @param newGender name of new gender
+     */
+    function addGender(uint256 id, string memory newGender) external;
+
+    /**
+     * @notice Enable or disable gender
+     * @param id of gender
+     * @param status true or false
+     */
+    function setIsActiveGender(uint256 id, bool status) external;
+
+    /**
+     * @notice Change name of LifeSpan token
+     * @param tokenId id LifeSpan token
+     * @param newName new name of LifeSpan token
+     */
+    function updateTokenName(uint256 tokenId, string memory newName) external;
+
+    /**
+     * @notice Change gender of LifeSpan token
+     * @param tokenId id LifeSpan token
+     * @param newGender id new gender of LifeSpan token
+     */
+    function updateTokenGender(uint256 tokenId, uint256 newGender) external;
+
+    /**
+     * @notice Update external url LifeSpan
+     * @param newExternalURL sting of new link
+     */
+    function updateExternalURL(string memory newExternalURL) external;
+
+    /**
+     * @notice Update generator images LifeSpan
+     * @param newRenderImageURL sting of new link
+     */
+    function updateRenderImageURL(string memory newRenderImageURL) external;
+
+    /**
+     * @notice Get information about birthday date user token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 birthday date
+     */
+    function getBirthdayDate(uint256 _tokenId) external view returns (uint256);
+
+    /**
+     * @notice Get information about date of mint token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 date of mint
+     */
+    function getDateOfMint(uint256 _tokenId) external view returns (uint256);
+
+    /**
+     * @notice Get information about death date user token
+     * @param _tokenId id LifeSpan token
+     * @return uint256 death date
+     */
+    function getDeathDate(uint256 _tokenId) external view returns (uint256);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC721/ERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC721Upgradeable.sol";
+import "./IERC721ReceiverUpgradeable.sol";
+import "./extensions/IERC721MetadataUpgradeable.sol";
+import "../../utils/AddressUpgradeable.sol";
+import "../../utils/ContextUpgradeable.sol";
+import "../../utils/StringsUpgradeable.sol";
+import "../../utils/introspection/ERC165Upgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Implementation of https://eips.ethereum.org/EIPS/eip-721[ERC721] Non-Fungible Token Standard, including
+ * the Metadata extension, but not including the Enumerable extension, which is available separately as
+ * {ERC721Enumerable}.
+ */
+contract ERC721Upgradeable is Initializable, ContextUpgradeable, ERC165Upgradeable, IERC721Upgradeable, IERC721MetadataUpgradeable {
+    using AddressUpgradeable for address;
+    using StringsUpgradeable for uint256;
+
+    // Token name
+    string private _name;
+
+    // Token symbol
+    string private _symbol;
+
+    // Mapping from token ID to owner address
+    mapping(uint256 => address) private _owners;
+
+    // Mapping owner address to token count
+    mapping(address => uint256) private _balances;
+
+    // Mapping from token ID to approved address
+    mapping(uint256 => address) private _tokenApprovals;
+
+    // Mapping from owner to operator approvals
+    mapping(address => mapping(address => bool)) private _operatorApprovals;
+
+    /**
+     * @dev Initializes the contract by setting a `name` and a `symbol` to the token collection.
+     */
+    function __ERC721_init(string memory name_, string memory symbol_) internal onlyInitializing {
+        __ERC721_init_unchained(name_, symbol_);
+    }
+
+    function __ERC721_init_unchained(string memory name_, string memory symbol_) internal onlyInitializing {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165Upgradeable, IERC165Upgradeable) returns (bool) {
+        return
+            interfaceId == type(IERC721Upgradeable).interfaceId ||
+            interfaceId == type(IERC721MetadataUpgradeable).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IERC721-balanceOf}.
+     */
+    function balanceOf(address owner) public view virtual override returns (uint256) {
+        require(owner != address(0), "ERC721: address zero is not a valid owner");
+        return _balances[owner];
+    }
+
+    /**
+     * @dev See {IERC721-ownerOf}.
+     */
+    function ownerOf(uint256 tokenId) public view virtual override returns (address) {
+        address owner = _owners[tokenId];
+        require(owner != address(0), "ERC721: invalid token ID");
+        return owner;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-name}.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-symbol}.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev See {IERC721Metadata-tokenURI}.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+        _requireMinted(tokenId);
+
+        string memory baseURI = _baseURI();
+        return bytes(baseURI).length > 0 ? string(abi.encodePacked(baseURI, tokenId.toString())) : "";
+    }
+
+    /**
+     * @dev Base URI for computing {tokenURI}. If set, the resulting URI for each
+     * token will be the concatenation of the `baseURI` and the `tokenId`. Empty
+     * by default, can be overridden in child contracts.
+     */
+    function _baseURI() internal view virtual returns (string memory) {
+        return "";
+    }
+
+    /**
+     * @dev See {IERC721-approve}.
+     */
+    function approve(address to, uint256 tokenId) public virtual override {
+        address owner = ERC721Upgradeable.ownerOf(tokenId);
+        require(to != owner, "ERC721: approval to current owner");
+
+        require(
+            _msgSender() == owner || isApprovedForAll(owner, _msgSender()),
+            "ERC721: approve caller is not token owner nor approved for all"
+        );
+
+        _approve(to, tokenId);
+    }
+
+    /**
+     * @dev See {IERC721-getApproved}.
+     */
+    function getApproved(uint256 tokenId) public view virtual override returns (address) {
+        _requireMinted(tokenId);
+
+        return _tokenApprovals[tokenId];
+    }
+
+    /**
+     * @dev See {IERC721-setApprovalForAll}.
+     */
+    function setApprovalForAll(address operator, bool approved) public virtual override {
+        _setApprovalForAll(_msgSender(), operator, approved);
+    }
+
+    /**
+     * @dev See {IERC721-isApprovedForAll}.
+     */
+    function isApprovedForAll(address owner, address operator) public view virtual override returns (bool) {
+        return _operatorApprovals[owner][operator];
+    }
+
+    /**
+     * @dev See {IERC721-transferFrom}.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public virtual override {
+        //solhint-disable-next-line max-line-length
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721: caller is not token owner nor approved");
+
+        _transfer(from, to, tokenId);
+    }
+
+    /**
+     * @dev See {IERC721-safeTransferFrom}.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public virtual override {
+        safeTransferFrom(from, to, tokenId, "");
+    }
+
+    /**
+     * @dev See {IERC721-safeTransferFrom}.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) public virtual override {
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721: caller is not token owner nor approved");
+        _safeTransfer(from, to, tokenId, data);
+    }
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * `data` is additional data, it has no specified format and it is sent in call to `to`.
+     *
+     * This internal function is equivalent to {safeTransferFrom}, and can be used to e.g.
+     * implement alternative mechanisms to perform token transfer, such as signature-based.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _safeTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) internal virtual {
+        _transfer(from, to, tokenId);
+        require(_checkOnERC721Received(from, to, tokenId, data), "ERC721: transfer to non ERC721Receiver implementer");
+    }
+
+    /**
+     * @dev Returns whether `tokenId` exists.
+     *
+     * Tokens can be managed by their owner or approved accounts via {approve} or {setApprovalForAll}.
+     *
+     * Tokens start existing when they are minted (`_mint`),
+     * and stop existing when they are burned (`_burn`).
+     */
+    function _exists(uint256 tokenId) internal view virtual returns (bool) {
+        return _owners[tokenId] != address(0);
+    }
+
+    /**
+     * @dev Returns whether `spender` is allowed to manage `tokenId`.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function _isApprovedOrOwner(address spender, uint256 tokenId) internal view virtual returns (bool) {
+        address owner = ERC721Upgradeable.ownerOf(tokenId);
+        return (spender == owner || isApprovedForAll(owner, spender) || getApproved(tokenId) == spender);
+    }
+
+    /**
+     * @dev Safely mints `tokenId` and transfers it to `to`.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must not exist.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _safeMint(address to, uint256 tokenId) internal virtual {
+        _safeMint(to, tokenId, "");
+    }
+
+    /**
+     * @dev Same as {xref-ERC721-_safeMint-address-uint256-}[`_safeMint`], with an additional `data` parameter which is
+     * forwarded in {IERC721Receiver-onERC721Received} to contract recipients.
+     */
+    function _safeMint(
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) internal virtual {
+        _mint(to, tokenId);
+        require(
+            _checkOnERC721Received(address(0), to, tokenId, data),
+            "ERC721: transfer to non ERC721Receiver implementer"
+        );
+    }
+
+    /**
+     * @dev Mints `tokenId` and transfers it to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {_safeMint} whenever possible
+     *
+     * Requirements:
+     *
+     * - `tokenId` must not exist.
+     * - `to` cannot be the zero address.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _mint(address to, uint256 tokenId) internal virtual {
+        require(to != address(0), "ERC721: mint to the zero address");
+        require(!_exists(tokenId), "ERC721: token already minted");
+
+        _beforeTokenTransfer(address(0), to, tokenId);
+
+        _balances[to] += 1;
+        _owners[tokenId] = to;
+
+        emit Transfer(address(0), to, tokenId);
+
+        _afterTokenTransfer(address(0), to, tokenId);
+    }
+
+    /**
+     * @dev Destroys `tokenId`.
+     * The approval is cleared when the token is burned.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _burn(uint256 tokenId) internal virtual {
+        address owner = ERC721Upgradeable.ownerOf(tokenId);
+
+        _beforeTokenTransfer(owner, address(0), tokenId);
+
+        // Clear approvals
+        _approve(address(0), tokenId);
+
+        _balances[owner] -= 1;
+        delete _owners[tokenId];
+
+        emit Transfer(owner, address(0), tokenId);
+
+        _afterTokenTransfer(owner, address(0), tokenId);
+    }
+
+    /**
+     * @dev Transfers `tokenId` from `from` to `to`.
+     *  As opposed to {transferFrom}, this imposes no restrictions on msg.sender.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     *
+     * Emits a {Transfer} event.
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {
+        require(ERC721Upgradeable.ownerOf(tokenId) == from, "ERC721: transfer from incorrect owner");
+        require(to != address(0), "ERC721: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, tokenId);
+
+        // Clear approvals from the previous owner
+        _approve(address(0), tokenId);
+
+        _balances[from] -= 1;
+        _balances[to] += 1;
+        _owners[tokenId] = to;
+
+        emit Transfer(from, to, tokenId);
+
+        _afterTokenTransfer(from, to, tokenId);
+    }
+
+    /**
+     * @dev Approve `to` to operate on `tokenId`
+     *
+     * Emits an {Approval} event.
+     */
+    function _approve(address to, uint256 tokenId) internal virtual {
+        _tokenApprovals[tokenId] = to;
+        emit Approval(ERC721Upgradeable.ownerOf(tokenId), to, tokenId);
+    }
+
+    /**
+     * @dev Approve `operator` to operate on all of `owner` tokens
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function _setApprovalForAll(
+        address owner,
+        address operator,
+        bool approved
+    ) internal virtual {
+        require(owner != operator, "ERC721: approve to caller");
+        _operatorApprovals[owner][operator] = approved;
+        emit ApprovalForAll(owner, operator, approved);
+    }
+
+    /**
+     * @dev Reverts if the `tokenId` has not been minted yet.
+     */
+    function _requireMinted(uint256 tokenId) internal view virtual {
+        require(_exists(tokenId), "ERC721: invalid token ID");
+    }
+
+    /**
+     * @dev Internal function to invoke {IERC721Receiver-onERC721Received} on a target address.
+     * The call is not executed if the target address is not a contract.
+     *
+     * @param from address representing the previous owner of the given token ID
+     * @param to target address that will receive the tokens
+     * @param tokenId uint256 ID of the token to be transferred
+     * @param data bytes optional data to send along with the call
+     * @return bool whether the call correctly returned the expected magic value
+     */
+    function _checkOnERC721Received(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) private returns (bool) {
+        if (to.isContract()) {
+            try IERC721ReceiverUpgradeable(to).onERC721Received(_msgSender(), from, tokenId, data) returns (bytes4 retval) {
+                return retval == IERC721ReceiverUpgradeable.onERC721Received.selector;
+            } catch (bytes memory reason) {
+                if (reason.length == 0) {
+                    revert("ERC721: transfer to non ERC721Receiver implementer");
+                } else {
+                    /// @solidity memory-safe-assembly
+                    assembly {
+                        revert(add(32, reason), mload(reason))
+                    }
+                }
+            }
+        } else {
+            return true;
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any token transfer. This includes minting
+     * and burning.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, ``from``'s `tokenId` will be
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` will be minted for `to`.
+     * - When `to` is zero, ``from``'s `tokenId` will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual {}
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[44] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/extensions/ERC721Enumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../ERC721Upgradeable.sol";
+import "./IERC721EnumerableUpgradeable.sol";
+import "../../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev This implements an optional extension of {ERC721} defined in the EIP that adds
+ * enumerability of all the token ids in the contract as well as all token ids owned by each
+ * account.
+ */
+abstract contract ERC721EnumerableUpgradeable is Initializable, ERC721Upgradeable, IERC721EnumerableUpgradeable {
+    function __ERC721Enumerable_init() internal onlyInitializing {
+    }
+
+    function __ERC721Enumerable_init_unchained() internal onlyInitializing {
+    }
+    // Mapping from owner to list of owned token IDs
+    mapping(address => mapping(uint256 => uint256)) private _ownedTokens;
+
+    // Mapping from token ID to index of the owner tokens list
+    mapping(uint256 => uint256) private _ownedTokensIndex;
+
+    // Array with all token ids, used for enumeration
+    uint256[] private _allTokens;
+
+    // Mapping from token id to position in the allTokens array
+    mapping(uint256 => uint256) private _allTokensIndex;
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165Upgradeable, ERC721Upgradeable) returns (bool) {
+        return interfaceId == type(IERC721EnumerableUpgradeable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IERC721Enumerable-tokenOfOwnerByIndex}.
+     */
+    function tokenOfOwnerByIndex(address owner, uint256 index) public view virtual override returns (uint256) {
+        require(index < ERC721Upgradeable.balanceOf(owner), "ERC721Enumerable: owner index out of bounds");
+        return _ownedTokens[owner][index];
+    }
+
+    /**
+     * @dev See {IERC721Enumerable-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _allTokens.length;
+    }
+
+    /**
+     * @dev See {IERC721Enumerable-tokenByIndex}.
+     */
+    function tokenByIndex(uint256 index) public view virtual override returns (uint256) {
+        require(index < ERC721EnumerableUpgradeable.totalSupply(), "ERC721Enumerable: global index out of bounds");
+        return _allTokens[index];
+    }
+
+    /**
+     * @dev Hook that is called before any token transfer. This includes minting
+     * and burning.
+     *
+     * Calling conditions:
+     *
+     * - When `from` and `to` are both non-zero, ``from``'s `tokenId` will be
+     * transferred to `to`.
+     * - When `from` is zero, `tokenId` will be minted for `to`.
+     * - When `to` is zero, ``from``'s `tokenId` will be burned.
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) internal virtual override {
+        super._beforeTokenTransfer(from, to, tokenId);
+
+        if (from == address(0)) {
+            _addTokenToAllTokensEnumeration(tokenId);
+        } else if (from != to) {
+            _removeTokenFromOwnerEnumeration(from, tokenId);
+        }
+        if (to == address(0)) {
+            _removeTokenFromAllTokensEnumeration(tokenId);
+        } else if (to != from) {
+            _addTokenToOwnerEnumeration(to, tokenId);
+        }
+    }
+
+    /**
+     * @dev Private function to add a token to this extension's ownership-tracking data structures.
+     * @param to address representing the new owner of the given token ID
+     * @param tokenId uint256 ID of the token to be added to the tokens list of the given address
+     */
+    function _addTokenToOwnerEnumeration(address to, uint256 tokenId) private {
+        uint256 length = ERC721Upgradeable.balanceOf(to);
+        _ownedTokens[to][length] = tokenId;
+        _ownedTokensIndex[tokenId] = length;
+    }
+
+    /**
+     * @dev Private function to add a token to this extension's token tracking data structures.
+     * @param tokenId uint256 ID of the token to be added to the tokens list
+     */
+    function _addTokenToAllTokensEnumeration(uint256 tokenId) private {
+        _allTokensIndex[tokenId] = _allTokens.length;
+        _allTokens.push(tokenId);
+    }
+
+    /**
+     * @dev Private function to remove a token from this extension's ownership-tracking data structures. Note that
+     * while the token is not assigned a new owner, the `_ownedTokensIndex` mapping is _not_ updated: this allows for
+     * gas optimizations e.g. when performing a transfer operation (avoiding double writes).
+     * This has O(1) time complexity, but alters the order of the _ownedTokens array.
+     * @param from address representing the previous owner of the given token ID
+     * @param tokenId uint256 ID of the token to be removed from the tokens list of the given address
+     */
+    function _removeTokenFromOwnerEnumeration(address from, uint256 tokenId) private {
+        // To prevent a gap in from's tokens array, we store the last token in the index of the token to delete, and
+        // then delete the last slot (swap and pop).
+
+        uint256 lastTokenIndex = ERC721Upgradeable.balanceOf(from) - 1;
+        uint256 tokenIndex = _ownedTokensIndex[tokenId];
+
+        // When the token to delete is the last token, the swap operation is unnecessary
+        if (tokenIndex != lastTokenIndex) {
+            uint256 lastTokenId = _ownedTokens[from][lastTokenIndex];
+
+            _ownedTokens[from][tokenIndex] = lastTokenId; // Move the last token to the slot of the to-delete token
+            _ownedTokensIndex[lastTokenId] = tokenIndex; // Update the moved token's index
+        }
+
+        // This also deletes the contents at the last position of the array
+        delete _ownedTokensIndex[tokenId];
+        delete _ownedTokens[from][lastTokenIndex];
+    }
+
+    /**
+     * @dev Private function to remove a token from this extension's token tracking data structures.
+     * This has O(1) time complexity, but alters the order of the _allTokens array.
+     * @param tokenId uint256 ID of the token to be removed from the tokens list
+     */
+    function _removeTokenFromAllTokensEnumeration(uint256 tokenId) private {
+        // To prevent a gap in the tokens array, we store the last token in the index of the token to delete, and
+        // then delete the last slot (swap and pop).
+
+        uint256 lastTokenIndex = _allTokens.length - 1;
+        uint256 tokenIndex = _allTokensIndex[tokenId];
+
+        // When the token to delete is the last token, the swap operation is unnecessary. However, since this occurs so
+        // rarely (when the last minted token is burnt) that we still do the swap here to avoid the gas cost of adding
+        // an 'if' statement (like in _removeTokenFromOwnerEnumeration)
+        uint256 lastTokenId = _allTokens[lastTokenIndex];
+
+        _allTokens[tokenIndex] = lastTokenId; // Move the last token to the slot of the to-delete token
+        _allTokensIndex[lastTokenId] = tokenIndex; // Update the moved token's index
+
+        // This also deletes the contents at the last position of the array
+        delete _allTokensIndex[tokenId];
+        _allTokens.pop();
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[46] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC721/extensions/ERC721Burnable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../ERC721Upgradeable.sol";
+import "../../../utils/ContextUpgradeable.sol";
+import "../../../proxy/utils/Initializable.sol";
+
+/**
+ * @title ERC721 Burnable Token
+ * @dev ERC721 Token that can be burned (destroyed).
+ */
+abstract contract ERC721BurnableUpgradeable is Initializable, ContextUpgradeable, ERC721Upgradeable {
+    function __ERC721Burnable_init() internal onlyInitializing {
+    }
+
+    function __ERC721Burnable_init_unchained() internal onlyInitializing {
+    }
+    /**
+     * @dev Burns `tokenId`. See {ERC721-_burn}.
+     *
+     * Requirements:
+     *
+     * - The caller must own `tokenId` or be an approved operator.
+     */
+    function burn(uint256 tokenId) public virtual {
+        //solhint-disable-next-line max-line-length
+        require(_isApprovedOrOwner(_msgSender(), tokenId), "ERC721: caller is not token owner nor approved");
+        _burn(tokenId);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Counters.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @title Counters
+ * @author Matt Condon (@shrugs)
+ * @dev Provides counters that can only be incremented, decremented or reset. This can be used e.g. to track the number
+ * of elements in a mapping, issuing ERC721 ids, or counting request ids.
+ *
+ * Include with `using Counters for Counters.Counter;`
+ */
+library CountersUpgradeable {
+    struct Counter {
+        // This variable should never be directly accessed by users of the library: interactions must be restricted to
+        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add
+        // this feature: see https://github.com/ethereum/solidity/issues/4637
+        uint256 _value; // default: 0
+    }
+
+    function current(Counter storage counter) internal view returns (uint256) {
+        return counter._value;
+    }
+
+    function increment(Counter storage counter) internal {
+        unchecked {
+            counter._value += 1;
+        }
+    }
+
+    function decrement(Counter storage counter) internal {
+        uint256 value = counter._value;
+        require(value > 0, "Counter: decrement overflow");
+        unchecked {
+            counter._value = value - 1;
+        }
+    }
+
+    function reset(Counter storage counter) internal {
+        counter._value = 0;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/Base64.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides a set of functions to operate with Base64 strings.
+ *
+ * _Available since v4.5._
+ */
+library Base64Upgradeable {
+    /**
+     * @dev Base64 Encoding/Decoding Table
+     */
+    string internal constant _TABLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /**
+     * @dev Converts a `bytes` to its Bytes64 `string` representation.
+     */
+    function encode(bytes memory data) internal pure returns (string memory) {
+        /**
+         * Inspired by Brecht Devos (Brechtpd) implementation - MIT licence
+         * https://github.com/Brechtpd/base64/blob/e78d9fd951e7b0977ddca77d92dc85183770daf4/base64.sol
+         */
+        if (data.length == 0) return "";
+
+        // Loads the table into memory
+        string memory table = _TABLE;
+
+        // Encoding takes 3 bytes chunks of binary data from `bytes` data parameter
+        // and split into 4 numbers of 6 bits.
+        // The final Base64 length should be `bytes` data length multiplied by 4/3 rounded up
+        // - `data.length + 2`  -> Round up
+        // - `/ 3`              -> Number of 3-bytes chunks
+        // - `4 *`              -> 4 characters for each chunk
+        string memory result = new string(4 * ((data.length + 2) / 3));
+
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Prepare the lookup table (skip the first "length" byte)
+            let tablePtr := add(table, 1)
+
+            // Prepare result pointer, jump over length
+            let resultPtr := add(result, 32)
+
+            // Run over the input, 3 bytes at a time
+            for {
+                let dataPtr := data
+                let endPtr := add(data, mload(data))
+            } lt(dataPtr, endPtr) {
+
+            } {
+                // Advance 3 bytes
+                dataPtr := add(dataPtr, 3)
+                let input := mload(dataPtr)
+
+                // To write each character, shift the 3 bytes (18 bits) chunk
+                // 4 times in blocks of 6 bits for each character (18, 12, 6, 0)
+                // and apply logical AND with 0x3F which is the number of
+                // the previous character in the ASCII table prior to the Base64 Table
+                // The result is then added to the table to get the character to write,
+                // and finally write it in the result pointer but with a left shift
+                // of 256 (1 byte) - 8 (1 ASCII char) = 248 bits
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(18, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(12, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(shr(6, input), 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+
+                mstore8(resultPtr, mload(add(tablePtr, and(input, 0x3F))))
+                resultPtr := add(resultPtr, 1) // Advance
+            }
+
+            // When data `bytes` is not exactly 3 bytes long
+            // it is padded with `=` characters at the end
+            switch mod(mload(data), 3)
+            case 1 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+                mstore8(sub(resultPtr, 2), 0x3d)
+            }
+            case 2 {
+                mstore8(sub(resultPtr, 1), 0x3d)
+            }
+        }
+
+        return result;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC721/IERC721.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../utils/introspection/IERC165Upgradeable.sol";
+
+/**
+ * @dev Required interface of an ERC721 compliant contract.
+ */
+interface IERC721Upgradeable is IERC165Upgradeable {
+    /**
+     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.
+     */
+    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);
+
+    /**
+     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.
+     */
+    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+
+    /**
+     * @dev Returns the number of tokens in ``owner``'s account.
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    /**
+     * @dev Returns the owner of the `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata data
+    ) external;
+
+    /**
+     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients
+     * are aware of the ERC721 protocol to prevent tokens from being forever locked.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must exist and be owned by `from`.
+     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or {setApprovalForAll}.
+     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.
+     *
+     * Emits a {Transfer} event.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Transfers `tokenId` token from `from` to `to`.
+     *
+     * WARNING: Usage of this method is discouraged, use {safeTransferFrom} whenever possible.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenId` token must be owned by `from`.
+     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external;
+
+    /**
+     * @dev Gives permission to `to` to transfer `tokenId` token to another account.
+     * The approval is cleared when the token is transferred.
+     *
+     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.
+     *
+     * Requirements:
+     *
+     * - The caller must own the token or be an approved operator.
+     * - `tokenId` must exist.
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address to, uint256 tokenId) external;
+
+    /**
+     * @dev Approve or remove `operator` as an operator for the caller.
+     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.
+     *
+     * Requirements:
+     *
+     * - The `operator` cannot be the caller.
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function setApprovalForAll(address operator, bool _approved) external;
+
+    /**
+     * @dev Returns the account approved for `tokenId` token.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function getApproved(uint256 tokenId) external view returns (address operator);
+
+    /**
+     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.
+     *
+     * See {setApprovalForAll}
+     */
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC721/IERC721Receiver.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @title ERC721 token receiver interface
+ * @dev Interface for any contract that wants to support safeTransfers
+ * from ERC721 asset contracts.
+ */
+interface IERC721ReceiverUpgradeable {
+    /**
+     * @dev Whenever an {IERC721} `tokenId` token is transferred to this contract via {IERC721-safeTransferFrom}
+     * by `operator` from `from`, this function is called.
+     *
+     * It must return its Solidity selector to confirm the token transfer.
+     * If any other value is returned or the interface is not implemented by the recipient, the transfer will be reverted.
+     *
+     * The selector can be obtained in Solidity with `IERC721Receiver.onERC721Received.selector`.
+     */
+    function onERC721Received(
+        address operator,
+        address from,
+        uint256 tokenId,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC721/extensions/IERC721Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC721Upgradeable.sol";
+
+/**
+ * @title ERC-721 Non-Fungible Token Standard, optional metadata extension
+ * @dev See https://eips.ethereum.org/EIPS/eip-721
+ */
+interface IERC721MetadataUpgradeable is IERC721Upgradeable {
+    /**
+     * @dev Returns the token collection name.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the token collection symbol.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.
+     */
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC721/extensions/IERC721Enumerable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC721Upgradeable.sol";
+
+/**
+ * @title ERC-721 Non-Fungible Token Standard, optional enumeration extension
+ * @dev See https://eips.ethereum.org/EIPS/eip-721
+ */
+interface IERC721EnumerableUpgradeable is IERC721Upgradeable {
+    /**
+     * @dev Returns the total amount of tokens stored by the contract.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID owned by `owner` at a given `index` of its token list.
+     * Use along with {balanceOf} to enumerate all of ``owner``'s tokens.
+     */
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+
+    /**
+     * @dev Returns a token ID at a given `index` of all the tokens stored by the contract.
+     * Use along with {totalSupply} to enumerate all tokens.
+     */
+    function tokenByIndex(uint256 index) external view returns (uint256);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushAccounts {
+    struct Account {
+        uint256 balance;
+    }
+
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Deposit tokens to the account
+     * @param account wallet address
+     * @param amount the amount to be deposited in tokens
+     */
+    function deposit(address account, uint256 amount) external;
+
+    /**
+     * @notice Withdraw ERC-20 tokens from user account to the current wallet address
+     * @param amount the amount of tokens being withdrawn
+     */
+    function withdraw(uint256 amount) external;
+
+    /**
+     * @notice Withdrawal of tokens by the controller from his account to available withdrawal addresses
+     * @param account withdraw address
+     * @param amount the amount of tokens being withdrawn
+     */
+    function withdrawByController(address account, uint256 amount) external;
+
+    /**
+     * @notice Transfer of tokens between accounts inside PlushAccounts
+     * @param account receiver address
+     * @param amount transfer amount
+     */
+    function internalTransfer(address account, uint256 amount) external;
+
+    /**
+     * @notice Debiting user tokens by the controller
+     * @param account user account
+     * @param amount amount of tokens debited
+     */
+    function decreaseAccountBalance(address account, uint256 amount) external;
+
+    /**
+     * @notice Return Plush Fee account balance
+     * @return account balance in wei
+     */
+    function getPlushFeeAccountBalance() external view returns (uint256);
+
+    /**
+     * @notice Check account balance
+     * @param account requesting account
+     * @return account balance in wei
+     */
+    function getAccountBalance(address account) external view returns (uint256);
+
+    /**
+     * @notice Set Plush fee address
+     * @param account fee address
+     */
+    function setPlushFeeAddress(address account) external;
+
+    /**
+     * @notice Get Plush fee address
+     * @return address
+     */
+    function getPlushFeeAddress() external view returns (address);
+
+    /// @notice Emitted when were the tokens deposited to the account
+    event Deposited(
+        address indexed sender,
+        address indexed account,
+        uint256 amount
+    );
+
+    /// @notice Emitted when were the tokens withdrawn from the account to the user address
+    event Withdrawn(address indexed account, uint256 amount);
+
+    /// @notice Emitted when were the tokens withdrawn from the account to the user address
+    event ControllerWithdrawn(
+        address indexed controller,
+        address indexed account,
+        uint256 amount
+    );
+
+    /// @notice Emitted when were the tokens transferred inside PlushAccounts
+    event Transferred(
+        address indexed sender,
+        address indexed recipient,
+        uint256 amount
+    );
+
+    /// @notice Emitted when the controller debits the user's tokens
+    event Debited(
+        address indexed controller,
+        address indexed account,
+        uint256 amount
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushApps {
+    struct Apps {
+        bytes32 name;
+        uint256 fee;
+        bool active;
+        bool exists;
+    }
+
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Add new app to PlushApps
+     * @param name App name in bytes32
+     * @param controllerAddress App controller address
+     * @param fee App ecosystem fee in wei
+     */
+    function addNewApp(
+        bytes32 name,
+        address controllerAddress,
+        uint256 fee
+    ) external;
+
+    /**
+     * @notice Check if the application exists
+     * @param controllerAddress App controller address
+     * @return boolean exists status
+     */
+    function getAppExists(address controllerAddress)
+        external
+        view
+        returns (bool);
+
+    /**
+     * @notice Delete app from PlushApps
+     * @param controllerAddress App controller address
+     */
+    function deleteApp(address controllerAddress) external;
+
+    /**
+     * @notice Get app fee
+     * @param controllerAddress controller address
+     * @return App fee
+     */
+    function getFeeApp(address controllerAddress)
+        external
+        view
+        returns (uint256);
+
+    /**
+     * @notice Change fee app
+     * @param controllerAddress App controller address
+     * @param fee App ecosystem fee in wei
+     */
+    function setFeeApp(address controllerAddress, uint256 fee) external;
+
+    /**
+     * @notice Activating the application
+     * @param controllerAddress App controller address
+     */
+    function setAppEnable(address controllerAddress) external;
+
+    /**
+     * @notice Disabling the application
+     * @param controllerAddress App controller address
+     */
+    function setAppDisable(address controllerAddress) external;
+
+    /**
+     * @notice Update application controller address
+     * @param oldControllerAddress exist controller application address
+     * @param newControllerAddress new controller application address
+     */
+    function setNewController(
+        address oldControllerAddress,
+        address newControllerAddress
+    ) external;
+
+    /**
+     * @notice Get app status (enable/disable)
+     * @param controllerAddress app controller address
+     * @return app enable status in boolean
+     */
+    function getAppStatus(address controllerAddress)
+        external
+        view
+        returns (bool);
+
+    /// @notice Emitted when app is added
+    event AppAdded(
+        bytes32 name,
+        address indexed controllerAddress,
+        uint256 fee
+    );
+
+    /// @notice Emitted when app has been deleted
+    event AppDeleted(address indexed controllerAddress);
+
+    /// @notice Emitted when app fee was changed
+    event AppFeeChanged(address indexed controllerAddress, uint256 fee);
+
+    /// @notice Emitted when enable app
+    event AppEnabled(address indexed controllerAddress);
+
+    /// @notice Emitted when disable app
+    event AppDisabled(address indexed controllerAddress);
+
+    /// @notice Emitted changed controlled address
+    event AppControllerAddressUpdated(
+        address indexed oldControllerAddress,
+        address indexed newControllerAddress
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushBlacklist {
+    /**
+     * @notice Checks if account is blacklisted
+     * @param _account The address to check
+     */
+    function isBlacklisted(address _account) external view returns (bool);
+
+    /**
+     * @notice Adds account to blacklist
+     * @param _account The address to blacklist
+     */
+    function blacklist(address _account) external;
+
+    /**
+     * @notice Removes account from blacklist
+     * @param _account The address to remove from the blacklist
+     */
+    function unBlacklist(address _account) external;
+
+    /// @notice Emitted when when the account was blacklisted
+    event Blacklisted(address indexed account);
+
+    /// @notice Emitted when the account was removed from the blacklist
+    event UnBlacklisted(address indexed account);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../../interfaces/IPlushLifeSpanNFTCashbackPool.sol";
+
+import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+import "../../governance/PlushBlacklist.sol";
+
+contract PlushLifeSpanNFTCashbackPool is
+    IPlushLifeSpanNFTCashbackPool,
+    Initializable,
+    PausableUpgradeable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    IERC20Upgradeable public plush;
+
+    PlushBlacklist public plushBlacklist;
+
+    uint256 private remuneration;
+    uint256 private timeUnlock;
+    bool private unlockAllTokens;
+    uint256[] allIds;
+
+    mapping(address => uint256[]) private idsBalances;
+    mapping(uint256 => Balance) private balanceInfo;
+
+    modifier notBlacklisted(address _account) {
+        require(
+            !plushBlacklist.isBlacklisted(_account),
+            "Blacklist: account is blacklisted"
+        );
+        _;
+    }
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant REMUNERATION_ROLE = keccak256("REMUNERATION_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        IERC20Upgradeable _plush,
+        PlushBlacklist _plushBlacklist,
+        uint256 _remuneration,
+        uint256 _timeUnlock
+    ) public initializer {
+        plush = _plush;
+        plushBlacklist = _plushBlacklist;
+
+        remuneration = _remuneration;
+        timeUnlock = _timeUnlock;
+        unlockAllTokens = false;
+
+        __Pausable_init();
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(REMUNERATION_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /// @notice Pause contract
+    function pause() public onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /// @notice Unpause contract
+    function unpause() public onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @notice Add remuneration to account manually
+     * @param account address to add remuneration
+     * @param amount of tokens in wei
+     */
+    function addRemunerationToAccountManually(address account, uint256 amount)
+        public
+        onlyRole(OPERATOR_ROLE)
+        notBlacklisted(account)
+    {
+        require(getFreeTokensInContract() >= amount, "Not enough funds");
+
+        uint256 id = idsBalances[account].length;
+
+        allIds.push(id);
+        idsBalances[account].push(id);
+
+        balanceInfo[id] = Balance(amount, 0);
+
+        emit RemunerationManually(msg.sender, account, amount);
+    }
+
+    /**
+     * @notice Add remuneration to account
+     * @param account address to add remuneration
+     */
+    function addRemunerationToAccount(address account)
+        public
+        onlyRole(REMUNERATION_ROLE)
+    {
+        if (getFreeTokensInContract() >= remuneration) {
+            uint256 id = idsBalances[account].length;
+
+            allIds.push(id);
+            idsBalances[account].push(id);
+
+            if (unlockAllTokens) {
+                balanceInfo[id] = Balance(
+                    remuneration,
+                    block.timestamp + timeUnlock
+                );
+            } else {
+                balanceInfo[id] = Balance(remuneration, 0);
+            }
+        }
+    }
+
+    /**
+     * @notice Withdrawal tokens to address
+     * @param amount of tokens in wei
+     */
+    function withdraw(uint256 amount) external notBlacklisted(msg.sender) {
+        require(plush.balanceOf(address(this)) >= amount, "Pool is empty.");
+        require(
+            getAvailableBalanceInAccount(msg.sender) >= amount,
+            "Not enough balance."
+        );
+
+        decreaseWalletAmount(msg.sender, amount);
+
+        plush.safeTransfer(msg.sender, amount);
+
+        emit WithdrawalTokens(msg.sender, amount);
+    }
+
+    /**
+     * @notice Set remuneration
+     * @param amount of tokens in wei
+     */
+    function setRemuneration(uint256 amount) public onlyRole(OPERATOR_ROLE) {
+        remuneration = amount;
+    }
+
+    /**
+     * @notice Set time lock
+     * @param amount time in sec
+     */
+    function setTimeUnlock(uint256 amount) public onlyRole(OPERATOR_ROLE) {
+        timeUnlock = amount;
+    }
+
+    /**
+     * @notice Switch to unlock all tokens
+     */
+    function unlockAllTokensSwitch() public onlyRole(OPERATOR_ROLE) {
+        unlockAllTokens = !unlockAllTokens;
+    }
+
+    /**
+     * @notice Get wallet amount in wei
+     * @param account address
+     * @return array of lock and unlock tokens
+     */
+    function getWalletAmount(address account)
+        external
+        view
+        returns (
+            uint256[] memory,
+            uint256[] memory,
+            uint256[] memory,
+            uint256[] memory
+        )
+    {
+        uint256[] memory availableBalance = new uint256[](
+            idsBalances[account].length
+        );
+        uint256[] memory availableTimeIsActive = new uint256[](
+            idsBalances[account].length
+        );
+        uint256[] memory unavailableBalance = new uint256[](
+            idsBalances[account].length
+        );
+        uint256[] memory unavailableTimeIsActive = new uint256[](
+            idsBalances[account].length
+        );
+
+        for (uint256 i = 0; i < idsBalances[account].length; i++) {
+            if (unlockAllTokens || balanceInfo[i].timeIsActive != 0) {
+                if (balanceInfo[i].timeIsActive < block.timestamp) {
+                    availableBalance[i] = balanceInfo[i].balance;
+                    availableTimeIsActive[i] = balanceInfo[i].timeIsActive;
+                } else {
+                    unavailableBalance[i] = balanceInfo[i].balance;
+                    unavailableTimeIsActive[i] = balanceInfo[i].timeIsActive;
+                }
+            } else {
+                unavailableBalance[i] = balanceInfo[i].balance;
+                unavailableTimeIsActive[i] = balanceInfo[i].timeIsActive;
+            }
+        }
+
+        return (
+            availableBalance,
+            availableTimeIsActive,
+            unavailableBalance,
+            unavailableTimeIsActive
+        );
+    }
+
+    /**
+     * @notice Get remuneration
+     * @return amount of tokens in wei
+     */
+    function getRemuneration() external view returns (uint256) {
+        return remuneration;
+    }
+
+    /**
+     * @notice Get time unlock
+     * @return amount time in sec
+     */
+    function getTimeUnlock() external view returns (uint256) {
+        return timeUnlock;
+    }
+
+    /**
+     * @notice Get available tokens in the contract
+     * @return amount of tokens in wei
+     */
+    function getFreeTokensInContract() private view returns (uint256) {
+        uint256 unavailableTokens = 0;
+
+        for (uint256 i = 0; i < allIds.length; i++) {
+            unavailableTokens += balanceInfo[allIds[i]].balance;
+        }
+
+        return plush.balanceOf(address(this)) - unavailableTokens;
+    }
+
+    /**
+     * @notice Get available tokens in the account
+     * @return amount of tokens in wei
+     */
+    function getAvailableBalanceInAccount(address account)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 availableBalance = 0;
+
+        for (uint256 i = 0; i < idsBalances[account].length; i++) {
+            if (unlockAllTokens || balanceInfo[i].timeIsActive != 0) {
+                if (balanceInfo[i].timeIsActive < block.timestamp) {
+                    availableBalance += balanceInfo[i].balance;
+                }
+            }
+        }
+
+        return availableBalance;
+    }
+
+    /**
+     * @notice Decrease in the user's balance when withdrawing funds
+     * @param account address
+     * @param amount tokens in wei
+     */
+    function decreaseWalletAmount(address account, uint256 amount) private {
+        uint256 summary = amount;
+
+        for (uint256 i = 0; i < idsBalances[account].length; i++) {
+            if (unlockAllTokens || balanceInfo[i].timeIsActive != 0) {
+                if (balanceInfo[i].timeIsActive < block.timestamp) {
+                    if (summary < balanceInfo[i].balance) {
+                        balanceInfo[i].balance -= summary;
+                        break;
+                    } else if (summary == balanceInfo[i].balance) {
+                        deleteIdAndInfo(account, i);
+                        break;
+                    } else {
+                        summary -= balanceInfo[i].balance;
+                        deleteIdAndInfo(account, i);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Deleting information about the reward when withdrawing
+     * @param account address
+     * @param id remuneration id
+     */
+    function deleteIdAndInfo(address account, uint256 id) private {
+        delete balanceInfo[id];
+        delete allIds[id];
+
+        for (uint256 j = 0; j < idsBalances[account].length; j++) {
+            if (idsBalances[account][j] == id) {
+                delete idsBalances[account][j];
+            }
+        }
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushLifeSpanNFTCashbackPool {
+    struct Balance {
+        uint256 balance;
+        uint256 timeIsActive;
+    }
+
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Add remuneration to account manually
+     * @param account address to add remuneration
+     * @param amount of tokens in wei
+     */
+    function addRemunerationToAccountManually(address account, uint256 amount)
+        external;
+
+    /**
+     * @notice Add remuneration to account
+     * @param account address to add remuneration
+     */
+    function addRemunerationToAccount(address account) external;
+
+    /**
+     * @notice Withdrawal tokens to address
+     * @param amount of tokens in wei
+     */
+    function withdraw(uint256 amount) external;
+
+    /**
+     * @notice Set remuneration
+     * @param amount of tokens in wei
+     */
+    function setRemuneration(uint256 amount) external;
+
+    /**
+     * @notice Set time lock
+     * @param amount time in sec
+     */
+    function setTimeUnlock(uint256 amount) external;
+
+    /**
+     * @notice Switch to unlock all tokens
+     */
+    function unlockAllTokensSwitch() external;
+
+    /**
+     * @notice Get wallet amount in wei
+     * @param account address
+     * @return array of lock and unlock tokens
+     */
+    function getWalletAmount(address account)
+        external
+        view
+        returns (
+            uint256[] memory,
+            uint256[] memory,
+            uint256[] memory,
+            uint256[] memory
+        );
+
+    /**
+     * @notice Get remuneration
+     * @return amount of tokens in wei
+     */
+    function getRemuneration() external view returns (uint256);
+
+    /**
+     * @notice Get time unlock
+     * @return amount time in sec
+     */
+    function getTimeUnlock() external view returns (uint256);
+
+    /// @notice Emitted when user withdrawal unlocked tokens
+    event WithdrawalTokens(address indexed receiver, uint256 amount);
+
+    /// @notice Emitted when added remuneration to account manually
+    event RemunerationManually(
+        address indexed sender,
+        address indexed receiver,
+        uint256 amount
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../../interfaces/IPlushVestingSeedInvestorsPool.sol";
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+import "../../token/ERC721/PlushSeed.sol";
+
+contract PlushVestingSeedInvestorsPool is
+    IPlushVestingSeedInvestorsPool,
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    IERC20Upgradeable public plush;
+    PlushSeed public plushSeed;
+
+    uint256 public idPlushSeed; // PlushSeed (NFT) token ID
+
+    uint256 private mainPercent; //Percent release at IDO
+    uint256 private daysUnlock; //How many days will it be unlocked
+    uint256 private amountDaily; //Number of tokens broken into pieces
+    uint256 private unlockBalance; //Number of tokens available for withdrawal (release at IDO)
+    uint256 private timeStart; //Start counter start after (release at IDO)
+
+    bool private isIDO;
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        IERC20Upgradeable _plush,
+        PlushSeed _plushSeed,
+        uint256 _idPlushSeed,
+        uint256 _mainPercent,
+        uint256 _daysUnlock
+    ) public initializer {
+        plush = _plush;
+        plushSeed = _plushSeed;
+        idPlushSeed = _idPlushSeed;
+        mainPercent = _mainPercent;
+        daysUnlock = _daysUnlock;
+
+        isIDO = false;
+
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Returns how many tokens are locked
+     * @return Number of tokens in wei
+     */
+    function getLockBalance() public view returns (uint256) {
+        if (isIDO) {
+            uint256 amountUnlockRemuneration = 0;
+
+            for (
+                uint256 i = 0;
+                i < (block.timestamp - timeStart) / 1 days;
+                i++
+            ) {
+                amountUnlockRemuneration += amountDaily;
+            }
+
+            if (
+                (unlockBalance + amountUnlockRemuneration) >
+                plush.balanceOf(address(this))
+            ) {
+                return 0;
+            } else {
+                return
+                    plush.balanceOf(address(this)) -
+                    (unlockBalance + amountUnlockRemuneration);
+            }
+        } else {
+            return plush.balanceOf(address(this));
+        }
+    }
+
+    /**
+     * @notice Returns how many tokens are unlock
+     * @return Number of tokens in wei
+     */
+    function getUnLockBalance() public view returns (uint256) {
+        if (isIDO) {
+            uint256 amountUnlockRemuneration = 0;
+
+            for (
+                uint256 i = 0;
+                i < (block.timestamp - timeStart) / 1 days;
+                i++
+            ) {
+                amountUnlockRemuneration += amountDaily;
+            }
+
+            if (
+                (unlockBalance + amountUnlockRemuneration) >
+                plush.balanceOf(address(this))
+            ) {
+                return plush.balanceOf(address(this));
+            } else {
+                return unlockBalance + amountUnlockRemuneration;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Withdrawal of unlocked tokens
+     */
+    function withdraw() external {
+        require(getUnLockBalance() > 0, "Insufficient funds.");
+        require(
+            plushSeed.ownerOf(idPlushSeed) == msg.sender,
+            "You are not the owner of the lot."
+        );
+
+        uint256 unlockBalanceTemp = getUnLockBalance();
+        uint256 timePast = block.timestamp - timeStart;
+
+        unlockBalance = 0;
+
+        while (timePast > 1 days) {
+            timePast -= 1 days;
+        }
+
+        timeStart = block.timestamp - timePast;
+        plush.safeTransfer(msg.sender, unlockBalanceTemp);
+
+        emit WithdrawalTokens(msg.sender, unlockBalanceTemp);
+    }
+
+    /**
+     * @notice Start release at IDO (unlocking the first part of the tokens and starting the reward every day)
+     */
+    function releaseAtIDO() external onlyRole(OPERATOR_ROLE) {
+        require(!isIDO, "Already complete.");
+
+        unlockBalance = (plush.balanceOf(address(this)) * mainPercent) / 100000;
+        amountDaily =
+            (plush.balanceOf(address(this)) - unlockBalance) /
+            daysUnlock;
+        timeStart = block.timestamp;
+        isIDO = true;
+
+        emit ReleaseIDO(msg.sender, timeStart);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushVestingSeedInvestorsPool {
+    /**
+     * @notice Returns how many tokens are locked
+     * @return Number of tokens in wei
+     */
+    function getLockBalance() external view returns(uint256);
+
+    /**
+    * @notice Returns how many tokens are unlock
+     * @return Number of tokens in wei
+     */
+    function getUnLockBalance() external view returns(uint256);
+
+    /**
+     * @notice Withdrawal of unlocked tokens
+     */
+    function withdraw() external;
+
+    /**
+     * @notice Start release at IDO (unlocking the first part of the tokens and starting the reward every day)
+     */
+    function releaseAtIDO() external;
+
+    /// @notice Emitted when user withdrawal unlocked tokens
+    event WithdrawalTokens(
+        address indexed receiver,
+        uint256 amount
+    );
+
+    /// @notice Emitted when release at IDO
+    event ReleaseIDO(
+        address indexed sender,
+        uint256 time
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721BurnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
+
+/// @custom:security-contact [email protected]
+contract PlushSeed is Initializable, ERC721Upgradeable, ERC721EnumerableUpgradeable, ERC721URIStorageUpgradeable, ERC721BurnableUpgradeable, OwnableUpgradeable, UUPSUpgradeable {
+    using CountersUpgradeable for CountersUpgradeable.Counter;
+
+    CountersUpgradeable.Counter private _tokenIdCounter;
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize() initializer public {
+        __ERC721_init("PlushSeed", "SEED");
+        __ERC721Enumerable_init();
+        __ERC721URIStorage_init();
+        __ERC721Burnable_init();
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+    }
+
+    function safeMint(address to, string memory uri) public onlyOwner {
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
+        _safeMint(to, tokenId);
+        _setTokenURI(tokenId, uri);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+    internal
+    onlyOwner
+    override
+    {}
+
+    // The following functions are overrides required by Solidity.
+
+    function _beforeTokenTransfer(address from, address to, uint256 tokenId)
+    internal
+    override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+    {
+        super._beforeTokenTransfer(from, to, tokenId);
+    }
+
+    function _burn(uint256 tokenId)
+    internal
+    override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
+    {
+        super._burn(tokenId);
+    }
+
+    function tokenURI(uint256 tokenId)
+    public
+    view
+    override(ERC721Upgradeable, ERC721URIStorageUpgradeable)
+    returns (string memory)
+    {
+        return super.tokenURI(tokenId);
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+    public
+    view
+    override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+    returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC721/extensions/ERC721URIStorage.sol)
+
+pragma solidity ^0.8.0;
+
+import "../ERC721Upgradeable.sol";
+import "../../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev ERC721 token with storage based token URI management.
+ */
+abstract contract ERC721URIStorageUpgradeable is Initializable, ERC721Upgradeable {
+    function __ERC721URIStorage_init() internal onlyInitializing {
+    }
+
+    function __ERC721URIStorage_init_unchained() internal onlyInitializing {
+    }
+    using StringsUpgradeable for uint256;
+
+    // Optional mapping for token URIs
+    mapping(uint256 => string) private _tokenURIs;
+
+    /**
+     * @dev See {IERC721Metadata-tokenURI}.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
+        _requireMinted(tokenId);
+
+        string memory _tokenURI = _tokenURIs[tokenId];
+        string memory base = _baseURI();
+
+        // If there is no base URI, return the token URI.
+        if (bytes(base).length == 0) {
+            return _tokenURI;
+        }
+        // If both are set, concatenate the baseURI and tokenURI (via abi.encodePacked).
+        if (bytes(_tokenURI).length > 0) {
+            return string(abi.encodePacked(base, _tokenURI));
+        }
+
+        return super.tokenURI(tokenId);
+    }
+
+    /**
+     * @dev Sets `_tokenURI` as the tokenURI of `tokenId`.
+     *
+     * Requirements:
+     *
+     * - `tokenId` must exist.
+     */
+    function _setTokenURI(uint256 tokenId, string memory _tokenURI) internal virtual {
+        require(_exists(tokenId), "ERC721URIStorage: URI set of nonexistent token");
+        _tokenURIs[tokenId] = _tokenURI;
+    }
+
+    /**
+     * @dev See {ERC721-_burn}. This override additionally checks to see if a
+     * token-specific URI was set for the token, and if so, it deletes the token URI from
+     * the storage mapping.
+     */
+    function _burn(uint256 tokenId) internal virtual override {
+        super._burn(tokenId);
+
+        if (bytes(_tokenURIs[tokenId]).length != 0) {
+            delete _tokenURIs[tokenId];
+        }
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/ContextUpgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract OwnableUpgradeable is Initializable, ContextUpgradeable {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    function __Ownable_init() internal onlyInitializing {
+        __Ownable_init_unchained();
+    }
+
+    function __Ownable_init_unchained() internal onlyInitializing {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (governance/TimelockController.sol)
+
+pragma solidity ^0.8.0;
+
+import "../access/AccessControlUpgradeable.sol";
+import "../token/ERC721/IERC721ReceiverUpgradeable.sol";
+import "../token/ERC1155/IERC1155ReceiverUpgradeable.sol";
+import "../utils/AddressUpgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Contract module which acts as a timelocked controller. When set as the
+ * owner of an `Ownable` smart contract, it enforces a timelock on all
+ * `onlyOwner` maintenance operations. This gives time for users of the
+ * controlled contract to exit before a potentially dangerous maintenance
+ * operation is applied.
+ *
+ * By default, this contract is self administered, meaning administration tasks
+ * have to go through the timelock process. The proposer (resp executor) role
+ * is in charge of proposing (resp executing) operations. A common use case is
+ * to position this {TimelockController} as the owner of a smart contract, with
+ * a multisig or a DAO as the sole proposer.
+ *
+ * _Available since v3.3._
+ */
+contract TimelockControllerUpgradeable is Initializable, AccessControlUpgradeable, IERC721ReceiverUpgradeable, IERC1155ReceiverUpgradeable {
+    bytes32 public constant TIMELOCK_ADMIN_ROLE = keccak256("TIMELOCK_ADMIN_ROLE");
+    bytes32 public constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
+    bytes32 public constant EXECUTOR_ROLE = keccak256("EXECUTOR_ROLE");
+    bytes32 public constant CANCELLER_ROLE = keccak256("CANCELLER_ROLE");
+    uint256 internal constant _DONE_TIMESTAMP = uint256(1);
+
+    mapping(bytes32 => uint256) private _timestamps;
+    uint256 private _minDelay;
+
+    /**
+     * @dev Emitted when a call is scheduled as part of operation `id`.
+     */
+    event CallScheduled(
+        bytes32 indexed id,
+        uint256 indexed index,
+        address target,
+        uint256 value,
+        bytes data,
+        bytes32 predecessor,
+        uint256 delay
+    );
+
+    /**
+     * @dev Emitted when a call is performed as part of operation `id`.
+     */
+    event CallExecuted(bytes32 indexed id, uint256 indexed index, address target, uint256 value, bytes data);
+
+    /**
+     * @dev Emitted when operation `id` is cancelled.
+     */
+    event Cancelled(bytes32 indexed id);
+
+    /**
+     * @dev Emitted when the minimum delay for future operations is modified.
+     */
+    event MinDelayChange(uint256 oldDuration, uint256 newDuration);
+
+    /**
+     * @dev Initializes the contract with a given `minDelay`, and a list of
+     * initial proposers and executors. The proposers receive both the
+     * proposer and the canceller role (for backward compatibility). The
+     * executors receive the executor role.
+     *
+     * NOTE: At construction, both the deployer and the timelock itself are
+     * administrators. This helps further configuration of the timelock by the
+     * deployer. After configuration is done, it is recommended that the
+     * deployer renounces its admin position and relies on timelocked
+     * operations to perform future maintenance.
+     */
+    function __TimelockController_init(
+        uint256 minDelay,
+        address[] memory proposers,
+        address[] memory executors
+    ) internal onlyInitializing {
+        __TimelockController_init_unchained(minDelay, proposers, executors);
+    }
+
+    function __TimelockController_init_unchained(
+        uint256 minDelay,
+        address[] memory proposers,
+        address[] memory executors
+    ) internal onlyInitializing {
+        _setRoleAdmin(TIMELOCK_ADMIN_ROLE, TIMELOCK_ADMIN_ROLE);
+        _setRoleAdmin(PROPOSER_ROLE, TIMELOCK_ADMIN_ROLE);
+        _setRoleAdmin(EXECUTOR_ROLE, TIMELOCK_ADMIN_ROLE);
+        _setRoleAdmin(CANCELLER_ROLE, TIMELOCK_ADMIN_ROLE);
+
+        // deployer + self administration
+        _setupRole(TIMELOCK_ADMIN_ROLE, _msgSender());
+        _setupRole(TIMELOCK_ADMIN_ROLE, address(this));
+
+        // register proposers and cancellers
+        for (uint256 i = 0; i < proposers.length; ++i) {
+            _setupRole(PROPOSER_ROLE, proposers[i]);
+            _setupRole(CANCELLER_ROLE, proposers[i]);
+        }
+
+        // register executors
+        for (uint256 i = 0; i < executors.length; ++i) {
+            _setupRole(EXECUTOR_ROLE, executors[i]);
+        }
+
+        _minDelay = minDelay;
+        emit MinDelayChange(0, minDelay);
+    }
+
+    /**
+     * @dev Modifier to make a function callable only by a certain role. In
+     * addition to checking the sender's role, `address(0)` 's role is also
+     * considered. Granting a role to `address(0)` is equivalent to enabling
+     * this role for everyone.
+     */
+    modifier onlyRoleOrOpenRole(bytes32 role) {
+        if (!hasRole(role, address(0))) {
+            _checkRole(role, _msgSender());
+        }
+        _;
+    }
+
+    /**
+     * @dev Contract might receive/hold ETH as part of the maintenance process.
+     */
+    receive() external payable {}
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165Upgradeable, AccessControlUpgradeable) returns (bool) {
+        return interfaceId == type(IERC1155ReceiverUpgradeable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Returns whether an id correspond to a registered operation. This
+     * includes both Pending, Ready and Done operations.
+     */
+    function isOperation(bytes32 id) public view virtual returns (bool registered) {
+        return getTimestamp(id) > 0;
+    }
+
+    /**
+     * @dev Returns whether an operation is pending or not.
+     */
+    function isOperationPending(bytes32 id) public view virtual returns (bool pending) {
+        return getTimestamp(id) > _DONE_TIMESTAMP;
+    }
+
+    /**
+     * @dev Returns whether an operation is ready or not.
+     */
+    function isOperationReady(bytes32 id) public view virtual returns (bool ready) {
+        uint256 timestamp = getTimestamp(id);
+        return timestamp > _DONE_TIMESTAMP && timestamp <= block.timestamp;
+    }
+
+    /**
+     * @dev Returns whether an operation is done or not.
+     */
+    function isOperationDone(bytes32 id) public view virtual returns (bool done) {
+        return getTimestamp(id) == _DONE_TIMESTAMP;
+    }
+
+    /**
+     * @dev Returns the timestamp at with an operation becomes ready (0 for
+     * unset operations, 1 for done operations).
+     */
+    function getTimestamp(bytes32 id) public view virtual returns (uint256 timestamp) {
+        return _timestamps[id];
+    }
+
+    /**
+     * @dev Returns the minimum delay for an operation to become valid.
+     *
+     * This value can be changed by executing an operation that calls `updateDelay`.
+     */
+    function getMinDelay() public view virtual returns (uint256 duration) {
+        return _minDelay;
+    }
+
+    /**
+     * @dev Returns the identifier of an operation containing a single
+     * transaction.
+     */
+    function hashOperation(
+        address target,
+        uint256 value,
+        bytes calldata data,
+        bytes32 predecessor,
+        bytes32 salt
+    ) public pure virtual returns (bytes32 hash) {
+        return keccak256(abi.encode(target, value, data, predecessor, salt));
+    }
+
+    /**
+     * @dev Returns the identifier of an operation containing a batch of
+     * transactions.
+     */
+    function hashOperationBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata payloads,
+        bytes32 predecessor,
+        bytes32 salt
+    ) public pure virtual returns (bytes32 hash) {
+        return keccak256(abi.encode(targets, values, payloads, predecessor, salt));
+    }
+
+    /**
+     * @dev Schedule an operation containing a single transaction.
+     *
+     * Emits a {CallScheduled} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have the 'proposer' role.
+     */
+    function schedule(
+        address target,
+        uint256 value,
+        bytes calldata data,
+        bytes32 predecessor,
+        bytes32 salt,
+        uint256 delay
+    ) public virtual onlyRole(PROPOSER_ROLE) {
+        bytes32 id = hashOperation(target, value, data, predecessor, salt);
+        _schedule(id, delay);
+        emit CallScheduled(id, 0, target, value, data, predecessor, delay);
+    }
+
+    /**
+     * @dev Schedule an operation containing a batch of transactions.
+     *
+     * Emits one {CallScheduled} event per transaction in the batch.
+     *
+     * Requirements:
+     *
+     * - the caller must have the 'proposer' role.
+     */
+    function scheduleBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata payloads,
+        bytes32 predecessor,
+        bytes32 salt,
+        uint256 delay
+    ) public virtual onlyRole(PROPOSER_ROLE) {
+        require(targets.length == values.length, "TimelockController: length mismatch");
+        require(targets.length == payloads.length, "TimelockController: length mismatch");
+
+        bytes32 id = hashOperationBatch(targets, values, payloads, predecessor, salt);
+        _schedule(id, delay);
+        for (uint256 i = 0; i < targets.length; ++i) {
+            emit CallScheduled(id, i, targets[i], values[i], payloads[i], predecessor, delay);
+        }
+    }
+
+    /**
+     * @dev Schedule an operation that is to becomes valid after a given delay.
+     */
+    function _schedule(bytes32 id, uint256 delay) private {
+        require(!isOperation(id), "TimelockController: operation already scheduled");
+        require(delay >= getMinDelay(), "TimelockController: insufficient delay");
+        _timestamps[id] = block.timestamp + delay;
+    }
+
+    /**
+     * @dev Cancel an operation.
+     *
+     * Requirements:
+     *
+     * - the caller must have the 'canceller' role.
+     */
+    function cancel(bytes32 id) public virtual onlyRole(CANCELLER_ROLE) {
+        require(isOperationPending(id), "TimelockController: operation cannot be cancelled");
+        delete _timestamps[id];
+
+        emit Cancelled(id);
+    }
+
+    /**
+     * @dev Execute an (ready) operation containing a single transaction.
+     *
+     * Emits a {CallExecuted} event.
+     *
+     * Requirements:
+     *
+     * - the caller must have the 'executor' role.
+     */
+    // This function can reenter, but it doesn't pose a risk because _afterCall checks that the proposal is pending,
+    // thus any modifications to the operation during reentrancy should be caught.
+    // slither-disable-next-line reentrancy-eth
+    function execute(
+        address target,
+        uint256 value,
+        bytes calldata payload,
+        bytes32 predecessor,
+        bytes32 salt
+    ) public payable virtual onlyRoleOrOpenRole(EXECUTOR_ROLE) {
+        bytes32 id = hashOperation(target, value, payload, predecessor, salt);
+
+        _beforeCall(id, predecessor);
+        _execute(target, value, payload);
+        emit CallExecuted(id, 0, target, value, payload);
+        _afterCall(id);
+    }
+
+    /**
+     * @dev Execute an (ready) operation containing a batch of transactions.
+     *
+     * Emits one {CallExecuted} event per transaction in the batch.
+     *
+     * Requirements:
+     *
+     * - the caller must have the 'executor' role.
+     */
+    function executeBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata payloads,
+        bytes32 predecessor,
+        bytes32 salt
+    ) public payable virtual onlyRoleOrOpenRole(EXECUTOR_ROLE) {
+        require(targets.length == values.length, "TimelockController: length mismatch");
+        require(targets.length == payloads.length, "TimelockController: length mismatch");
+
+        bytes32 id = hashOperationBatch(targets, values, payloads, predecessor, salt);
+
+        _beforeCall(id, predecessor);
+        for (uint256 i = 0; i < targets.length; ++i) {
+            address target = targets[i];
+            uint256 value = values[i];
+            bytes calldata payload = payloads[i];
+            _execute(target, value, payload);
+            emit CallExecuted(id, i, target, value, payload);
+        }
+        _afterCall(id);
+    }
+
+    /**
+     * @dev Execute an operation's call.
+     */
+    function _execute(
+        address target,
+        uint256 value,
+        bytes calldata data
+    ) internal virtual {
+        (bool success, ) = target.call{value: value}(data);
+        require(success, "TimelockController: underlying transaction reverted");
+    }
+
+    /**
+     * @dev Checks before execution of an operation's calls.
+     */
+    function _beforeCall(bytes32 id, bytes32 predecessor) private view {
+        require(isOperationReady(id), "TimelockController: operation is not ready");
+        require(predecessor == bytes32(0) || isOperationDone(predecessor), "TimelockController: missing dependency");
+    }
+
+    /**
+     * @dev Checks after execution of an operation's calls.
+     */
+    function _afterCall(bytes32 id) private {
+        require(isOperationReady(id), "TimelockController: operation is not ready");
+        _timestamps[id] = _DONE_TIMESTAMP;
+    }
+
+    /**
+     * @dev Changes the minimum timelock duration for future operations.
+     *
+     * Emits a {MinDelayChange} event.
+     *
+     * Requirements:
+     *
+     * - the caller must be the timelock itself. This can only be achieved by scheduling and later executing
+     * an operation where the timelock is the target and the data is the ABI-encoded call to this function.
+     */
+    function updateDelay(uint256 newDelay) external virtual {
+        require(msg.sender == address(this), "TimelockController: caller must be timelock");
+        emit MinDelayChange(_minDelay, newDelay);
+        _minDelay = newDelay;
+    }
+
+    /**
+     * @dev See {IERC721Receiver-onERC721Received}.
+     */
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155Received}.
+     */
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155BatchReceived}.
+     */
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] memory,
+        uint256[] memory,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[48] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC1155/IERC1155Receiver.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../utils/introspection/IERC165Upgradeable.sol";
+
+/**
+ * @dev _Available since v3.1._
+ */
+interface IERC1155ReceiverUpgradeable is IERC165Upgradeable {
+    /**
+     * @dev Handles the receipt of a single ERC1155 token type. This function is
+     * called at the end of a `safeTransferFrom` after the balance has been updated.
+     *
+     * NOTE: To accept the transfer, this must return
+     * `bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))`
+     * (i.e. 0xf23a6e61, or its own function selector).
+     *
+     * @param operator The address which initiated the transfer (i.e. msg.sender)
+     * @param from The address which previously owned the token
+     * @param id The ID of the token being transferred
+     * @param value The amount of tokens being transferred
+     * @param data Additional data with no specified format
+     * @return `bytes4(keccak256("onERC1155Received(address,address,uint256,uint256,bytes)"))` if transfer is allowed
+     */
+    function onERC1155Received(
+        address operator,
+        address from,
+        uint256 id,
+        uint256 value,
+        bytes calldata data
+    ) external returns (bytes4);
+
+    /**
+     * @dev Handles the receipt of a multiple ERC1155 token types. This function
+     * is called at the end of a `safeBatchTransferFrom` after the balances have
+     * been updated.
+     *
+     * NOTE: To accept the transfer(s), this must return
+     * `bytes4(keccak256("onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"))`
+     * (i.e. 0xbc197c81, or its own function selector).
+     *
+     * @param operator The address which initiated the batch transfer (i.e. msg.sender)
+     * @param from The address which previously owned the token
+     * @param ids An array containing ids of each token being transferred (order and length must match values array)
+     * @param values An array containing amounts of each token being transferred (order and length must match ids array)
+     * @param data Additional data with no specified format
+     * @return `bytes4(keccak256("onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)"))` if transfer is allowed
+     */
+    function onERC1155BatchReceived(
+        address operator,
+        address from,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) external returns (bytes4);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "@openzeppelin/contracts-upgradeable/governance/TimelockControllerUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+
+contract PlushTimeLock is Initializable, TimelockControllerUpgradeable, UUPSUpgradeable, OwnableUpgradeable  {
+  /// @custom:oz-upgrades-unsafe-allow constructor
+  constructor() {
+    _disableInitializers();
+  }
+
+  function initialize (uint256 minDelay, address[] memory proposers, address[] memory executors) initializer public
+  {
+    __UUPSUpgradeable_init();
+    __TimelockController_init(minDelay, proposers, executors);
+  }
+
+  function _authorizeUpgrade(address newImplementation) internal onlyOwner override
+  {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.2) (governance/Governor.sol)
+
+pragma solidity ^0.8.0;
+
+import "../token/ERC721/IERC721ReceiverUpgradeable.sol";
+import "../token/ERC1155/IERC1155ReceiverUpgradeable.sol";
+import "../utils/cryptography/ECDSAUpgradeable.sol";
+import "../utils/cryptography/draft-EIP712Upgradeable.sol";
+import "../utils/introspection/ERC165Upgradeable.sol";
+import "../utils/math/SafeCastUpgradeable.sol";
+import "../utils/structs/DoubleEndedQueueUpgradeable.sol";
+import "../utils/AddressUpgradeable.sol";
+import "../utils/ContextUpgradeable.sol";
+import "../utils/TimersUpgradeable.sol";
+import "./IGovernorUpgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Core of the governance system, designed to be extended though various modules.
+ *
+ * This contract is abstract and requires several function to be implemented in various modules:
+ *
+ * - A counting module must implement {quorum}, {_quorumReached}, {_voteSucceeded} and {_countVote}
+ * - A voting module must implement {_getVotes}
+ * - Additionanly, the {votingPeriod} must also be implemented
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorUpgradeable is Initializable, ContextUpgradeable, ERC165Upgradeable, EIP712Upgradeable, IGovernorUpgradeable, IERC721ReceiverUpgradeable, IERC1155ReceiverUpgradeable {
+    using DoubleEndedQueueUpgradeable for DoubleEndedQueueUpgradeable.Bytes32Deque;
+    using SafeCastUpgradeable for uint256;
+    using TimersUpgradeable for TimersUpgradeable.BlockNumber;
+
+    bytes32 public constant BALLOT_TYPEHASH = keccak256("Ballot(uint256 proposalId,uint8 support)");
+    bytes32 public constant EXTENDED_BALLOT_TYPEHASH =
+        keccak256("ExtendedBallot(uint256 proposalId,uint8 support,string reason,bytes params)");
+
+    struct ProposalCore {
+        TimersUpgradeable.BlockNumber voteStart;
+        TimersUpgradeable.BlockNumber voteEnd;
+        bool executed;
+        bool canceled;
+    }
+
+    string private _name;
+
+    mapping(uint256 => ProposalCore) private _proposals;
+
+    // This queue keeps track of the governor operating on itself. Calls to functions protected by the
+    // {onlyGovernance} modifier needs to be whitelisted in this queue. Whitelisting is set in {_beforeExecute},
+    // consumed by the {onlyGovernance} modifier and eventually reset in {_afterExecute}. This ensures that the
+    // execution of {onlyGovernance} protected calls can only be achieved through successful proposals.
+    DoubleEndedQueueUpgradeable.Bytes32Deque private _governanceCall;
+
+    /**
+     * @dev Restricts a function so it can only be executed through governance proposals. For example, governance
+     * parameter setters in {GovernorSettings} are protected using this modifier.
+     *
+     * The governance executing address may be different from the Governor's own address, for example it could be a
+     * timelock. This can be customized by modules by overriding {_executor}. The executor is only able to invoke these
+     * functions during the execution of the governor's {execute} function, and not under any other circumstances. Thus,
+     * for example, additional timelock proposers are not able to change governance parameters without going through the
+     * governance protocol (since v4.6).
+     */
+    modifier onlyGovernance() {
+        require(_msgSender() == _executor(), "Governor: onlyGovernance");
+        if (_executor() != address(this)) {
+            bytes32 msgDataHash = keccak256(_msgData());
+            // loop until popping the expected operation - throw if deque is empty (operation not authorized)
+            while (_governanceCall.popFront() != msgDataHash) {}
+        }
+        _;
+    }
+
+    /**
+     * @dev Sets the value for {name} and {version}
+     */
+    function __Governor_init(string memory name_) internal onlyInitializing {
+        __EIP712_init_unchained(name_, version());
+        __Governor_init_unchained(name_);
+    }
+
+    function __Governor_init_unchained(string memory name_) internal onlyInitializing {
+        _name = name_;
+    }
+
+    /**
+     * @dev Function to receive ETH that will be handled by the governor (disabled if executor is a third party contract)
+     */
+    receive() external payable virtual {
+        require(_executor() == address(this));
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165Upgradeable, ERC165Upgradeable) returns (bool) {
+        // In addition to the current interfaceId, also support previous version of the interfaceId that did not
+        // include the castVoteWithReasonAndParams() function as standard
+        return
+            interfaceId ==
+            (type(IGovernorUpgradeable).interfaceId ^
+                this.castVoteWithReasonAndParams.selector ^
+                this.castVoteWithReasonAndParamsBySig.selector ^
+                this.getVotesWithParams.selector) ||
+            interfaceId == type(IGovernorUpgradeable).interfaceId ||
+            interfaceId == type(IERC1155ReceiverUpgradeable).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IGovernor-name}.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev See {IGovernor-version}.
+     */
+    function version() public view virtual override returns (string memory) {
+        return "1";
+    }
+
+    /**
+     * @dev See {IGovernor-hashProposal}.
+     *
+     * The proposal id is produced by hashing the ABI encoded `targets` array, the `values` array, the `calldatas` array
+     * and the descriptionHash (bytes32 which itself is the keccak256 hash of the description string). This proposal id
+     * can be produced from the proposal data which is part of the {ProposalCreated} event. It can even be computed in
+     * advance, before the proposal is submitted.
+     *
+     * Note that the chainId and the governor address are not part of the proposal id computation. Consequently, the
+     * same proposal (with same operation and same description) will have the same id if submitted on multiple governors
+     * across multiple networks. This also means that in order to execute the same operation twice (on the same
+     * governor) the proposer will have to change the description in order to avoid proposal id conflicts.
+     */
+    function hashProposal(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public pure virtual override returns (uint256) {
+        return uint256(keccak256(abi.encode(targets, values, calldatas, descriptionHash)));
+    }
+
+    /**
+     * @dev See {IGovernor-state}.
+     */
+    function state(uint256 proposalId) public view virtual override returns (ProposalState) {
+        ProposalCore storage proposal = _proposals[proposalId];
+
+        if (proposal.executed) {
+            return ProposalState.Executed;
+        }
+
+        if (proposal.canceled) {
+            return ProposalState.Canceled;
+        }
+
+        uint256 snapshot = proposalSnapshot(proposalId);
+
+        if (snapshot == 0) {
+            revert("Governor: unknown proposal id");
+        }
+
+        if (snapshot >= block.number) {
+            return ProposalState.Pending;
+        }
+
+        uint256 deadline = proposalDeadline(proposalId);
+
+        if (deadline >= block.number) {
+            return ProposalState.Active;
+        }
+
+        if (_quorumReached(proposalId) && _voteSucceeded(proposalId)) {
+            return ProposalState.Succeeded;
+        } else {
+            return ProposalState.Defeated;
+        }
+    }
+
+    /**
+     * @dev See {IGovernor-proposalSnapshot}.
+     */
+    function proposalSnapshot(uint256 proposalId) public view virtual override returns (uint256) {
+        return _proposals[proposalId].voteStart.getDeadline();
+    }
+
+    /**
+     * @dev See {IGovernor-proposalDeadline}.
+     */
+    function proposalDeadline(uint256 proposalId) public view virtual override returns (uint256) {
+        return _proposals[proposalId].voteEnd.getDeadline();
+    }
+
+    /**
+     * @dev Part of the Governor Bravo's interface: _"The number of votes required in order for a voter to become a proposer"_.
+     */
+    function proposalThreshold() public view virtual returns (uint256) {
+        return 0;
+    }
+
+    /**
+     * @dev Amount of votes already cast passes the threshold limit.
+     */
+    function _quorumReached(uint256 proposalId) internal view virtual returns (bool);
+
+    /**
+     * @dev Is the proposal successful or not.
+     */
+    function _voteSucceeded(uint256 proposalId) internal view virtual returns (bool);
+
+    /**
+     * @dev Get the voting weight of `account` at a specific `blockNumber`, for a vote as described by `params`.
+     */
+    function _getVotes(
+        address account,
+        uint256 blockNumber,
+        bytes memory params
+    ) internal view virtual returns (uint256);
+
+    /**
+     * @dev Register a vote for `proposalId` by `account` with a given `support`, voting `weight` and voting `params`.
+     *
+     * Note: Support is generic and can represent various things depending on the voting system used.
+     */
+    function _countVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        uint256 weight,
+        bytes memory params
+    ) internal virtual;
+
+    /**
+     * @dev Default additional encoded parameters used by castVote methods that don't include them
+     *
+     * Note: Should be overridden by specific implementations to use an appropriate value, the
+     * meaning of the additional params, in the context of that implementation
+     */
+    function _defaultParams() internal view virtual returns (bytes memory) {
+        return "";
+    }
+
+    /**
+     * @dev See {IGovernor-propose}.
+     */
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public virtual override returns (uint256) {
+        require(
+            getVotes(_msgSender(), block.number - 1) >= proposalThreshold(),
+            "Governor: proposer votes below proposal threshold"
+        );
+
+        uint256 proposalId = hashProposal(targets, values, calldatas, keccak256(bytes(description)));
+
+        require(targets.length == values.length, "Governor: invalid proposal length");
+        require(targets.length == calldatas.length, "Governor: invalid proposal length");
+        require(targets.length > 0, "Governor: empty proposal");
+
+        ProposalCore storage proposal = _proposals[proposalId];
+        require(proposal.voteStart.isUnset(), "Governor: proposal already exists");
+
+        uint64 snapshot = block.number.toUint64() + votingDelay().toUint64();
+        uint64 deadline = snapshot + votingPeriod().toUint64();
+
+        proposal.voteStart.setDeadline(snapshot);
+        proposal.voteEnd.setDeadline(deadline);
+
+        emit ProposalCreated(
+            proposalId,
+            _msgSender(),
+            targets,
+            values,
+            new string[](targets.length),
+            calldatas,
+            snapshot,
+            deadline,
+            description
+        );
+
+        return proposalId;
+    }
+
+    /**
+     * @dev See {IGovernor-execute}.
+     */
+    function execute(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public payable virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+
+        ProposalState status = state(proposalId);
+        require(
+            status == ProposalState.Succeeded || status == ProposalState.Queued,
+            "Governor: proposal not successful"
+        );
+        _proposals[proposalId].executed = true;
+
+        emit ProposalExecuted(proposalId);
+
+        _beforeExecute(proposalId, targets, values, calldatas, descriptionHash);
+        _execute(proposalId, targets, values, calldatas, descriptionHash);
+        _afterExecute(proposalId, targets, values, calldatas, descriptionHash);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Internal execution mechanism. Can be overridden to implement different execution mechanism
+     */
+    function _execute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        string memory errorMessage = "Governor: call reverted without message";
+        for (uint256 i = 0; i < targets.length; ++i) {
+            (bool success, bytes memory returndata) = targets[i].call{value: values[i]}(calldatas[i]);
+            AddressUpgradeable.verifyCallResult(success, returndata, errorMessage);
+        }
+    }
+
+    /**
+     * @dev Hook before execution is triggered.
+     */
+    function _beforeExecute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory, /* values */
+        bytes[] memory calldatas,
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        if (_executor() != address(this)) {
+            for (uint256 i = 0; i < targets.length; ++i) {
+                if (targets[i] == address(this)) {
+                    _governanceCall.pushBack(keccak256(calldatas[i]));
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev Hook after execution is triggered.
+     */
+    function _afterExecute(
+        uint256, /* proposalId */
+        address[] memory, /* targets */
+        uint256[] memory, /* values */
+        bytes[] memory, /* calldatas */
+        bytes32 /*descriptionHash*/
+    ) internal virtual {
+        if (_executor() != address(this)) {
+            if (!_governanceCall.empty()) {
+                _governanceCall.clear();
+            }
+        }
+    }
+
+    /**
+     * @dev Internal cancel mechanism: locks up the proposal timer, preventing it from being re-submitted. Marks it as
+     * canceled to allow distinguishing it from executed proposals.
+     *
+     * Emits a {IGovernor-ProposalCanceled} event.
+     */
+    function _cancel(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+        ProposalState status = state(proposalId);
+
+        require(
+            status != ProposalState.Canceled && status != ProposalState.Expired && status != ProposalState.Executed,
+            "Governor: proposal not active"
+        );
+        _proposals[proposalId].canceled = true;
+
+        emit ProposalCanceled(proposalId);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev See {IGovernor-getVotes}.
+     */
+    function getVotes(address account, uint256 blockNumber) public view virtual override returns (uint256) {
+        return _getVotes(account, blockNumber, _defaultParams());
+    }
+
+    /**
+     * @dev See {IGovernor-getVotesWithParams}.
+     */
+    function getVotesWithParams(
+        address account,
+        uint256 blockNumber,
+        bytes memory params
+    ) public view virtual override returns (uint256) {
+        return _getVotes(account, blockNumber, params);
+    }
+
+    /**
+     * @dev See {IGovernor-castVote}.
+     */
+    function castVote(uint256 proposalId, uint8 support) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, "");
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReason}.
+     */
+    function castVoteWithReason(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason
+    ) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, reason);
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReasonAndParams}.
+     */
+    function castVoteWithReasonAndParams(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params
+    ) public virtual override returns (uint256) {
+        address voter = _msgSender();
+        return _castVote(proposalId, voter, support, reason, params);
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteBySig}.
+     */
+    function castVoteBySig(
+        uint256 proposalId,
+        uint8 support,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override returns (uint256) {
+        address voter = ECDSAUpgradeable.recover(
+            _hashTypedDataV4(keccak256(abi.encode(BALLOT_TYPEHASH, proposalId, support))),
+            v,
+            r,
+            s
+        );
+        return _castVote(proposalId, voter, support, "");
+    }
+
+    /**
+     * @dev See {IGovernor-castVoteWithReasonAndParamsBySig}.
+     */
+    function castVoteWithReasonAndParamsBySig(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual override returns (uint256) {
+        address voter = ECDSAUpgradeable.recover(
+            _hashTypedDataV4(
+                keccak256(
+                    abi.encode(
+                        EXTENDED_BALLOT_TYPEHASH,
+                        proposalId,
+                        support,
+                        keccak256(bytes(reason)),
+                        keccak256(params)
+                    )
+                )
+            ),
+            v,
+            r,
+            s
+        );
+
+        return _castVote(proposalId, voter, support, reason, params);
+    }
+
+    /**
+     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
+     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function. Uses the _defaultParams().
+     *
+     * Emits a {IGovernor-VoteCast} event.
+     */
+    function _castVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        string memory reason
+    ) internal virtual returns (uint256) {
+        return _castVote(proposalId, account, support, reason, _defaultParams());
+    }
+
+    /**
+     * @dev Internal vote casting mechanism: Check that the vote is pending, that it has not been cast yet, retrieve
+     * voting weight using {IGovernor-getVotes} and call the {_countVote} internal function.
+     *
+     * Emits a {IGovernor-VoteCast} event.
+     */
+    function _castVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        string memory reason,
+        bytes memory params
+    ) internal virtual returns (uint256) {
+        ProposalCore storage proposal = _proposals[proposalId];
+        require(state(proposalId) == ProposalState.Active, "Governor: vote not currently active");
+
+        uint256 weight = _getVotes(account, proposal.voteStart.getDeadline(), params);
+        _countVote(proposalId, account, support, weight, params);
+
+        if (params.length == 0) {
+            emit VoteCast(account, proposalId, support, weight, reason);
+        } else {
+            emit VoteCastWithParams(account, proposalId, support, weight, reason, params);
+        }
+
+        return weight;
+    }
+
+    /**
+     * @dev Relays a transaction or function call to an arbitrary target. In cases where the governance executor
+     * is some contract other than the governor itself, like when using a timelock, this function can be invoked
+     * in a governance proposal to recover tokens or Ether that was sent to the governor contract by mistake.
+     * Note that if the executor is simply the governor itself, use of `relay` is redundant.
+     */
+    function relay(
+        address target,
+        uint256 value,
+        bytes calldata data
+    ) external virtual onlyGovernance {
+        AddressUpgradeable.functionCallWithValue(target, data, value);
+    }
+
+    /**
+     * @dev Address through which the governor executes action. Will be overloaded by module that execute actions
+     * through another contract such as a timelock.
+     */
+    function _executor() internal view virtual returns (address) {
+        return address(this);
+    }
+
+    /**
+     * @dev See {IERC721Receiver-onERC721Received}.
+     */
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155Received}.
+     */
+    function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    /**
+     * @dev See {IERC1155Receiver-onERC1155BatchReceived}.
+     */
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] memory,
+        uint256[] memory,
+        bytes memory
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[46] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.3) (utils/cryptography/ECDSA.sol)
+
+pragma solidity ^0.8.0;
+
+import "../StringsUpgradeable.sol";
+
+/**
+ * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.
+ *
+ * These functions can be used to verify that a message was signed by the holder
+ * of the private keys of a given address.
+ */
+library ECDSAUpgradeable {
+    enum RecoverError {
+        NoError,
+        InvalidSignature,
+        InvalidSignatureLength,
+        InvalidSignatureS,
+        InvalidSignatureV
+    }
+
+    function _throwError(RecoverError error) private pure {
+        if (error == RecoverError.NoError) {
+            return; // no error: do nothing
+        } else if (error == RecoverError.InvalidSignature) {
+            revert("ECDSA: invalid signature");
+        } else if (error == RecoverError.InvalidSignatureLength) {
+            revert("ECDSA: invalid signature length");
+        } else if (error == RecoverError.InvalidSignatureS) {
+            revert("ECDSA: invalid signature 's' value");
+        } else if (error == RecoverError.InvalidSignatureV) {
+            revert("ECDSA: invalid signature 'v' value");
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature` or error string. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     *
+     * Documentation for signature generation:
+     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]
+     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError) {
+        if (signature.length == 65) {
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+            // ecrecover takes the signature parameters, and the only way to get them
+            // currently is to use assembly.
+            /// @solidity memory-safe-assembly
+            assembly {
+                r := mload(add(signature, 0x20))
+                s := mload(add(signature, 0x40))
+                v := byte(0, mload(add(signature, 0x60)))
+            }
+            return tryRecover(hash, v, r, s);
+        } else {
+            return (address(0), RecoverError.InvalidSignatureLength);
+        }
+    }
+
+    /**
+     * @dev Returns the address that signed a hashed message (`hash`) with
+     * `signature`. This address can then be used for verification purposes.
+     *
+     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:
+     * this function rejects them by requiring the `s` value to be in the lower
+     * half order, and the `v` value to be either 27 or 28.
+     *
+     * IMPORTANT: `hash` _must_ be the result of a hash operation for the
+     * verification to be secure: it is possible to craft signatures that
+     * recover to arbitrary addresses for non-hashed data. A safe way to ensure
+     * this is by receiving a hash of the original message (which may otherwise
+     * be too long), and then calling {toEthSignedMessageHash} on it.
+     */
+    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, signature);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.
+     *
+     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(
+        bytes32 hash,
+        bytes32 r,
+        bytes32 vs
+    ) internal pure returns (address, RecoverError) {
+        bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+        uint8 v = uint8((uint256(vs) >> 255) + 27);
+        return tryRecover(hash, v, r, s);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.
+     *
+     * _Available since v4.2._
+     */
+    function recover(
+        bytes32 hash,
+        bytes32 r,
+        bytes32 vs
+    ) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, r, vs);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     *
+     * _Available since v4.3._
+     */
+    function tryRecover(
+        bytes32 hash,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal pure returns (address, RecoverError) {
+        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature
+        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines
+        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most
+        // signatures from current libraries generate a unique signature with an s-value in the lower half order.
+        //
+        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept
+        // these malleable signatures as well.
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (address(0), RecoverError.InvalidSignatureS);
+        }
+        if (v != 27 && v != 28) {
+            return (address(0), RecoverError.InvalidSignatureV);
+        }
+
+        // If the signature is valid (and not malleable), return the signer address
+        address signer = ecrecover(hash, v, r, s);
+        if (signer == address(0)) {
+            return (address(0), RecoverError.InvalidSignature);
+        }
+
+        return (signer, RecoverError.NoError);
+    }
+
+    /**
+     * @dev Overload of {ECDSA-recover} that receives the `v`,
+     * `r` and `s` signature fields separately.
+     */
+    function recover(
+        bytes32 hash,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) internal pure returns (address) {
+        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);
+        _throwError(error);
+        return recovered;
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Message, created from a `hash`. This
+     * produces hash corresponding to the one signed with the
+     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]
+     * JSON-RPC method as part of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {
+        // 32 is the length in bytes of hash,
+        // enforced by the type signature above
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Message, created from `s`. This
+     * produces hash corresponding to the one signed with the
+     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]
+     * JSON-RPC method as part of EIP-191.
+     *
+     * See {recover}.
+     */
+    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n", StringsUpgradeable.toString(s.length), s));
+    }
+
+    /**
+     * @dev Returns an Ethereum Signed Typed Data, created from a
+     * `domainSeparator` and a `structHash`. This produces hash corresponding
+     * to the one signed with the
+     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]
+     * JSON-RPC method as part of EIP-712.
+     *
+     * See {recover}.
+     */
+    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/cryptography/draft-EIP712.sol)
+
+pragma solidity ^0.8.0;
+
+import "./ECDSAUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.
+ *
+ * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,
+ * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding
+ * they need in their contracts using a combination of `abi.encode` and `keccak256`.
+ *
+ * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding
+ * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA
+ * ({_hashTypedDataV4}).
+ *
+ * The implementation of the domain separator was designed to be as efficient as possible while still properly updating
+ * the chain id to protect against replay attacks on an eventual fork of the chain.
+ *
+ * NOTE: This contract implements the version of the encoding known as "v4", as implemented by the JSON RPC method
+ * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].
+ *
+ * _Available since v3.4._
+ *
+ * @custom:storage-size 52
+ */
+abstract contract EIP712Upgradeable is Initializable {
+    /* solhint-disable var-name-mixedcase */
+    bytes32 private _HASHED_NAME;
+    bytes32 private _HASHED_VERSION;
+    bytes32 private constant _TYPE_HASH = keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    /* solhint-enable var-name-mixedcase */
+
+    /**
+     * @dev Initializes the domain separator and parameter caches.
+     *
+     * The meaning of `name` and `version` is specified in
+     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:
+     *
+     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.
+     * - `version`: the current major version of the signing domain.
+     *
+     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart
+     * contract upgrade].
+     */
+    function __EIP712_init(string memory name, string memory version) internal onlyInitializing {
+        __EIP712_init_unchained(name, version);
+    }
+
+    function __EIP712_init_unchained(string memory name, string memory version) internal onlyInitializing {
+        bytes32 hashedName = keccak256(bytes(name));
+        bytes32 hashedVersion = keccak256(bytes(version));
+        _HASHED_NAME = hashedName;
+        _HASHED_VERSION = hashedVersion;
+    }
+
+    /**
+     * @dev Returns the domain separator for the current chain.
+     */
+    function _domainSeparatorV4() internal view returns (bytes32) {
+        return _buildDomainSeparator(_TYPE_HASH, _EIP712NameHash(), _EIP712VersionHash());
+    }
+
+    function _buildDomainSeparator(
+        bytes32 typeHash,
+        bytes32 nameHash,
+        bytes32 versionHash
+    ) private view returns (bytes32) {
+        return keccak256(abi.encode(typeHash, nameHash, versionHash, block.chainid, address(this)));
+    }
+
+    /**
+     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this
+     * function returns the hash of the fully encoded EIP712 message for this domain.
+     *
+     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:
+     *
+     * ```solidity
+     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(
+     *     keccak256("Mail(address to,string contents)"),
+     *     mailTo,
+     *     keccak256(bytes(mailContents))
+     * )));
+     * address signer = ECDSA.recover(digest, signature);
+     * ```
+     */
+    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {
+        return ECDSAUpgradeable.toTypedDataHash(_domainSeparatorV4(), structHash);
+    }
+
+    /**
+     * @dev The hash of the name parameter for the EIP712 domain.
+     *
+     * NOTE: This function reads from storage by default, but can be redefined to return a constant value if gas costs
+     * are a concern.
+     */
+    function _EIP712NameHash() internal virtual view returns (bytes32) {
+        return _HASHED_NAME;
+    }
+
+    /**
+     * @dev The hash of the version parameter for the EIP712 domain.
+     *
+     * NOTE: This function reads from storage by default, but can be redefined to return a constant value if gas costs
+     * are a concern.
+     */
+    function _EIP712VersionHash() internal virtual view returns (bytes32) {
+        return _HASHED_VERSION;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/math/SafeCast.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Wrappers over Solidity's uintXX/intXX casting operators with added overflow
+ * checks.
+ *
+ * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can
+ * easily result in undesired exploitation or bugs, since developers usually
+ * assume that overflows raise errors. `SafeCast` restores this intuition by
+ * reverting the transaction when such an operation overflows.
+ *
+ * Using this library instead of the unchecked operations eliminates an entire
+ * class of bugs, so it's recommended to use it always.
+ *
+ * Can be combined with {SafeMath} and {SignedSafeMath} to extend it to smaller types, by performing
+ * all math on `uint256` and `int256` and then downcasting.
+ */
+library SafeCastUpgradeable {
+    /**
+     * @dev Returns the downcasted uint248 from uint256, reverting on
+     * overflow (when the input is greater than largest uint248).
+     *
+     * Counterpart to Solidity's `uint248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint248(uint256 value) internal pure returns (uint248) {
+        require(value <= type(uint248).max, "SafeCast: value doesn't fit in 248 bits");
+        return uint248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint240 from uint256, reverting on
+     * overflow (when the input is greater than largest uint240).
+     *
+     * Counterpart to Solidity's `uint240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint240(uint256 value) internal pure returns (uint240) {
+        require(value <= type(uint240).max, "SafeCast: value doesn't fit in 240 bits");
+        return uint240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint232 from uint256, reverting on
+     * overflow (when the input is greater than largest uint232).
+     *
+     * Counterpart to Solidity's `uint232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint232(uint256 value) internal pure returns (uint232) {
+        require(value <= type(uint232).max, "SafeCast: value doesn't fit in 232 bits");
+        return uint232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint224 from uint256, reverting on
+     * overflow (when the input is greater than largest uint224).
+     *
+     * Counterpart to Solidity's `uint224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint224(uint256 value) internal pure returns (uint224) {
+        require(value <= type(uint224).max, "SafeCast: value doesn't fit in 224 bits");
+        return uint224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint216 from uint256, reverting on
+     * overflow (when the input is greater than largest uint216).
+     *
+     * Counterpart to Solidity's `uint216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint216(uint256 value) internal pure returns (uint216) {
+        require(value <= type(uint216).max, "SafeCast: value doesn't fit in 216 bits");
+        return uint216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint208 from uint256, reverting on
+     * overflow (when the input is greater than largest uint208).
+     *
+     * Counterpart to Solidity's `uint208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint208(uint256 value) internal pure returns (uint208) {
+        require(value <= type(uint208).max, "SafeCast: value doesn't fit in 208 bits");
+        return uint208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint200 from uint256, reverting on
+     * overflow (when the input is greater than largest uint200).
+     *
+     * Counterpart to Solidity's `uint200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint200(uint256 value) internal pure returns (uint200) {
+        require(value <= type(uint200).max, "SafeCast: value doesn't fit in 200 bits");
+        return uint200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint192 from uint256, reverting on
+     * overflow (when the input is greater than largest uint192).
+     *
+     * Counterpart to Solidity's `uint192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint192(uint256 value) internal pure returns (uint192) {
+        require(value <= type(uint192).max, "SafeCast: value doesn't fit in 192 bits");
+        return uint192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint184 from uint256, reverting on
+     * overflow (when the input is greater than largest uint184).
+     *
+     * Counterpart to Solidity's `uint184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint184(uint256 value) internal pure returns (uint184) {
+        require(value <= type(uint184).max, "SafeCast: value doesn't fit in 184 bits");
+        return uint184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint176 from uint256, reverting on
+     * overflow (when the input is greater than largest uint176).
+     *
+     * Counterpart to Solidity's `uint176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint176(uint256 value) internal pure returns (uint176) {
+        require(value <= type(uint176).max, "SafeCast: value doesn't fit in 176 bits");
+        return uint176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint168 from uint256, reverting on
+     * overflow (when the input is greater than largest uint168).
+     *
+     * Counterpart to Solidity's `uint168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint168(uint256 value) internal pure returns (uint168) {
+        require(value <= type(uint168).max, "SafeCast: value doesn't fit in 168 bits");
+        return uint168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint160 from uint256, reverting on
+     * overflow (when the input is greater than largest uint160).
+     *
+     * Counterpart to Solidity's `uint160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint160(uint256 value) internal pure returns (uint160) {
+        require(value <= type(uint160).max, "SafeCast: value doesn't fit in 160 bits");
+        return uint160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint152 from uint256, reverting on
+     * overflow (when the input is greater than largest uint152).
+     *
+     * Counterpart to Solidity's `uint152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint152(uint256 value) internal pure returns (uint152) {
+        require(value <= type(uint152).max, "SafeCast: value doesn't fit in 152 bits");
+        return uint152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint144 from uint256, reverting on
+     * overflow (when the input is greater than largest uint144).
+     *
+     * Counterpart to Solidity's `uint144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint144(uint256 value) internal pure returns (uint144) {
+        require(value <= type(uint144).max, "SafeCast: value doesn't fit in 144 bits");
+        return uint144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint136 from uint256, reverting on
+     * overflow (when the input is greater than largest uint136).
+     *
+     * Counterpart to Solidity's `uint136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint136(uint256 value) internal pure returns (uint136) {
+        require(value <= type(uint136).max, "SafeCast: value doesn't fit in 136 bits");
+        return uint136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint128 from uint256, reverting on
+     * overflow (when the input is greater than largest uint128).
+     *
+     * Counterpart to Solidity's `uint128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint128(uint256 value) internal pure returns (uint128) {
+        require(value <= type(uint128).max, "SafeCast: value doesn't fit in 128 bits");
+        return uint128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint120 from uint256, reverting on
+     * overflow (when the input is greater than largest uint120).
+     *
+     * Counterpart to Solidity's `uint120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint120(uint256 value) internal pure returns (uint120) {
+        require(value <= type(uint120).max, "SafeCast: value doesn't fit in 120 bits");
+        return uint120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint112 from uint256, reverting on
+     * overflow (when the input is greater than largest uint112).
+     *
+     * Counterpart to Solidity's `uint112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint112(uint256 value) internal pure returns (uint112) {
+        require(value <= type(uint112).max, "SafeCast: value doesn't fit in 112 bits");
+        return uint112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint104 from uint256, reverting on
+     * overflow (when the input is greater than largest uint104).
+     *
+     * Counterpart to Solidity's `uint104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint104(uint256 value) internal pure returns (uint104) {
+        require(value <= type(uint104).max, "SafeCast: value doesn't fit in 104 bits");
+        return uint104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint96 from uint256, reverting on
+     * overflow (when the input is greater than largest uint96).
+     *
+     * Counterpart to Solidity's `uint96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.2._
+     */
+    function toUint96(uint256 value) internal pure returns (uint96) {
+        require(value <= type(uint96).max, "SafeCast: value doesn't fit in 96 bits");
+        return uint96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint88 from uint256, reverting on
+     * overflow (when the input is greater than largest uint88).
+     *
+     * Counterpart to Solidity's `uint88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint88(uint256 value) internal pure returns (uint88) {
+        require(value <= type(uint88).max, "SafeCast: value doesn't fit in 88 bits");
+        return uint88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint80 from uint256, reverting on
+     * overflow (when the input is greater than largest uint80).
+     *
+     * Counterpart to Solidity's `uint80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint80(uint256 value) internal pure returns (uint80) {
+        require(value <= type(uint80).max, "SafeCast: value doesn't fit in 80 bits");
+        return uint80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint72 from uint256, reverting on
+     * overflow (when the input is greater than largest uint72).
+     *
+     * Counterpart to Solidity's `uint72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint72(uint256 value) internal pure returns (uint72) {
+        require(value <= type(uint72).max, "SafeCast: value doesn't fit in 72 bits");
+        return uint72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint64 from uint256, reverting on
+     * overflow (when the input is greater than largest uint64).
+     *
+     * Counterpart to Solidity's `uint64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint64(uint256 value) internal pure returns (uint64) {
+        require(value <= type(uint64).max, "SafeCast: value doesn't fit in 64 bits");
+        return uint64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint56 from uint256, reverting on
+     * overflow (when the input is greater than largest uint56).
+     *
+     * Counterpart to Solidity's `uint56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint56(uint256 value) internal pure returns (uint56) {
+        require(value <= type(uint56).max, "SafeCast: value doesn't fit in 56 bits");
+        return uint56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint48 from uint256, reverting on
+     * overflow (when the input is greater than largest uint48).
+     *
+     * Counterpart to Solidity's `uint48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint48(uint256 value) internal pure returns (uint48) {
+        require(value <= type(uint48).max, "SafeCast: value doesn't fit in 48 bits");
+        return uint48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint40 from uint256, reverting on
+     * overflow (when the input is greater than largest uint40).
+     *
+     * Counterpart to Solidity's `uint40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint40(uint256 value) internal pure returns (uint40) {
+        require(value <= type(uint40).max, "SafeCast: value doesn't fit in 40 bits");
+        return uint40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint32 from uint256, reverting on
+     * overflow (when the input is greater than largest uint32).
+     *
+     * Counterpart to Solidity's `uint32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint32(uint256 value) internal pure returns (uint32) {
+        require(value <= type(uint32).max, "SafeCast: value doesn't fit in 32 bits");
+        return uint32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint24 from uint256, reverting on
+     * overflow (when the input is greater than largest uint24).
+     *
+     * Counterpart to Solidity's `uint24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toUint24(uint256 value) internal pure returns (uint24) {
+        require(value <= type(uint24).max, "SafeCast: value doesn't fit in 24 bits");
+        return uint24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint16 from uint256, reverting on
+     * overflow (when the input is greater than largest uint16).
+     *
+     * Counterpart to Solidity's `uint16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint16(uint256 value) internal pure returns (uint16) {
+        require(value <= type(uint16).max, "SafeCast: value doesn't fit in 16 bits");
+        return uint16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted uint8 from uint256, reverting on
+     * overflow (when the input is greater than largest uint8).
+     *
+     * Counterpart to Solidity's `uint8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v2.5._
+     */
+    function toUint8(uint256 value) internal pure returns (uint8) {
+        require(value <= type(uint8).max, "SafeCast: value doesn't fit in 8 bits");
+        return uint8(value);
+    }
+
+    /**
+     * @dev Converts a signed int256 into an unsigned uint256.
+     *
+     * Requirements:
+     *
+     * - input must be greater than or equal to 0.
+     *
+     * _Available since v3.0._
+     */
+    function toUint256(int256 value) internal pure returns (uint256) {
+        require(value >= 0, "SafeCast: value must be positive");
+        return uint256(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int248 from int256, reverting on
+     * overflow (when the input is less than smallest int248 or
+     * greater than largest int248).
+     *
+     * Counterpart to Solidity's `int248` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 248 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt248(int256 value) internal pure returns (int248) {
+        require(value >= type(int248).min && value <= type(int248).max, "SafeCast: value doesn't fit in 248 bits");
+        return int248(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int240 from int256, reverting on
+     * overflow (when the input is less than smallest int240 or
+     * greater than largest int240).
+     *
+     * Counterpart to Solidity's `int240` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 240 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt240(int256 value) internal pure returns (int240) {
+        require(value >= type(int240).min && value <= type(int240).max, "SafeCast: value doesn't fit in 240 bits");
+        return int240(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int232 from int256, reverting on
+     * overflow (when the input is less than smallest int232 or
+     * greater than largest int232).
+     *
+     * Counterpart to Solidity's `int232` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 232 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt232(int256 value) internal pure returns (int232) {
+        require(value >= type(int232).min && value <= type(int232).max, "SafeCast: value doesn't fit in 232 bits");
+        return int232(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int224 from int256, reverting on
+     * overflow (when the input is less than smallest int224 or
+     * greater than largest int224).
+     *
+     * Counterpart to Solidity's `int224` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 224 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt224(int256 value) internal pure returns (int224) {
+        require(value >= type(int224).min && value <= type(int224).max, "SafeCast: value doesn't fit in 224 bits");
+        return int224(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int216 from int256, reverting on
+     * overflow (when the input is less than smallest int216 or
+     * greater than largest int216).
+     *
+     * Counterpart to Solidity's `int216` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 216 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt216(int256 value) internal pure returns (int216) {
+        require(value >= type(int216).min && value <= type(int216).max, "SafeCast: value doesn't fit in 216 bits");
+        return int216(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int208 from int256, reverting on
+     * overflow (when the input is less than smallest int208 or
+     * greater than largest int208).
+     *
+     * Counterpart to Solidity's `int208` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 208 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt208(int256 value) internal pure returns (int208) {
+        require(value >= type(int208).min && value <= type(int208).max, "SafeCast: value doesn't fit in 208 bits");
+        return int208(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int200 from int256, reverting on
+     * overflow (when the input is less than smallest int200 or
+     * greater than largest int200).
+     *
+     * Counterpart to Solidity's `int200` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 200 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt200(int256 value) internal pure returns (int200) {
+        require(value >= type(int200).min && value <= type(int200).max, "SafeCast: value doesn't fit in 200 bits");
+        return int200(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int192 from int256, reverting on
+     * overflow (when the input is less than smallest int192 or
+     * greater than largest int192).
+     *
+     * Counterpart to Solidity's `int192` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 192 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt192(int256 value) internal pure returns (int192) {
+        require(value >= type(int192).min && value <= type(int192).max, "SafeCast: value doesn't fit in 192 bits");
+        return int192(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int184 from int256, reverting on
+     * overflow (when the input is less than smallest int184 or
+     * greater than largest int184).
+     *
+     * Counterpart to Solidity's `int184` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 184 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt184(int256 value) internal pure returns (int184) {
+        require(value >= type(int184).min && value <= type(int184).max, "SafeCast: value doesn't fit in 184 bits");
+        return int184(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int176 from int256, reverting on
+     * overflow (when the input is less than smallest int176 or
+     * greater than largest int176).
+     *
+     * Counterpart to Solidity's `int176` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 176 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt176(int256 value) internal pure returns (int176) {
+        require(value >= type(int176).min && value <= type(int176).max, "SafeCast: value doesn't fit in 176 bits");
+        return int176(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int168 from int256, reverting on
+     * overflow (when the input is less than smallest int168 or
+     * greater than largest int168).
+     *
+     * Counterpart to Solidity's `int168` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 168 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt168(int256 value) internal pure returns (int168) {
+        require(value >= type(int168).min && value <= type(int168).max, "SafeCast: value doesn't fit in 168 bits");
+        return int168(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int160 from int256, reverting on
+     * overflow (when the input is less than smallest int160 or
+     * greater than largest int160).
+     *
+     * Counterpart to Solidity's `int160` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 160 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt160(int256 value) internal pure returns (int160) {
+        require(value >= type(int160).min && value <= type(int160).max, "SafeCast: value doesn't fit in 160 bits");
+        return int160(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int152 from int256, reverting on
+     * overflow (when the input is less than smallest int152 or
+     * greater than largest int152).
+     *
+     * Counterpart to Solidity's `int152` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 152 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt152(int256 value) internal pure returns (int152) {
+        require(value >= type(int152).min && value <= type(int152).max, "SafeCast: value doesn't fit in 152 bits");
+        return int152(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int144 from int256, reverting on
+     * overflow (when the input is less than smallest int144 or
+     * greater than largest int144).
+     *
+     * Counterpart to Solidity's `int144` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 144 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt144(int256 value) internal pure returns (int144) {
+        require(value >= type(int144).min && value <= type(int144).max, "SafeCast: value doesn't fit in 144 bits");
+        return int144(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int136 from int256, reverting on
+     * overflow (when the input is less than smallest int136 or
+     * greater than largest int136).
+     *
+     * Counterpart to Solidity's `int136` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 136 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt136(int256 value) internal pure returns (int136) {
+        require(value >= type(int136).min && value <= type(int136).max, "SafeCast: value doesn't fit in 136 bits");
+        return int136(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int128 from int256, reverting on
+     * overflow (when the input is less than smallest int128 or
+     * greater than largest int128).
+     *
+     * Counterpart to Solidity's `int128` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 128 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt128(int256 value) internal pure returns (int128) {
+        require(value >= type(int128).min && value <= type(int128).max, "SafeCast: value doesn't fit in 128 bits");
+        return int128(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int120 from int256, reverting on
+     * overflow (when the input is less than smallest int120 or
+     * greater than largest int120).
+     *
+     * Counterpart to Solidity's `int120` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 120 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt120(int256 value) internal pure returns (int120) {
+        require(value >= type(int120).min && value <= type(int120).max, "SafeCast: value doesn't fit in 120 bits");
+        return int120(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int112 from int256, reverting on
+     * overflow (when the input is less than smallest int112 or
+     * greater than largest int112).
+     *
+     * Counterpart to Solidity's `int112` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 112 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt112(int256 value) internal pure returns (int112) {
+        require(value >= type(int112).min && value <= type(int112).max, "SafeCast: value doesn't fit in 112 bits");
+        return int112(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int104 from int256, reverting on
+     * overflow (when the input is less than smallest int104 or
+     * greater than largest int104).
+     *
+     * Counterpart to Solidity's `int104` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 104 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt104(int256 value) internal pure returns (int104) {
+        require(value >= type(int104).min && value <= type(int104).max, "SafeCast: value doesn't fit in 104 bits");
+        return int104(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int96 from int256, reverting on
+     * overflow (when the input is less than smallest int96 or
+     * greater than largest int96).
+     *
+     * Counterpart to Solidity's `int96` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 96 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt96(int256 value) internal pure returns (int96) {
+        require(value >= type(int96).min && value <= type(int96).max, "SafeCast: value doesn't fit in 96 bits");
+        return int96(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int88 from int256, reverting on
+     * overflow (when the input is less than smallest int88 or
+     * greater than largest int88).
+     *
+     * Counterpart to Solidity's `int88` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 88 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt88(int256 value) internal pure returns (int88) {
+        require(value >= type(int88).min && value <= type(int88).max, "SafeCast: value doesn't fit in 88 bits");
+        return int88(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int80 from int256, reverting on
+     * overflow (when the input is less than smallest int80 or
+     * greater than largest int80).
+     *
+     * Counterpart to Solidity's `int80` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 80 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt80(int256 value) internal pure returns (int80) {
+        require(value >= type(int80).min && value <= type(int80).max, "SafeCast: value doesn't fit in 80 bits");
+        return int80(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int72 from int256, reverting on
+     * overflow (when the input is less than smallest int72 or
+     * greater than largest int72).
+     *
+     * Counterpart to Solidity's `int72` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 72 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt72(int256 value) internal pure returns (int72) {
+        require(value >= type(int72).min && value <= type(int72).max, "SafeCast: value doesn't fit in 72 bits");
+        return int72(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int64 from int256, reverting on
+     * overflow (when the input is less than smallest int64 or
+     * greater than largest int64).
+     *
+     * Counterpart to Solidity's `int64` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 64 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt64(int256 value) internal pure returns (int64) {
+        require(value >= type(int64).min && value <= type(int64).max, "SafeCast: value doesn't fit in 64 bits");
+        return int64(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int56 from int256, reverting on
+     * overflow (when the input is less than smallest int56 or
+     * greater than largest int56).
+     *
+     * Counterpart to Solidity's `int56` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 56 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt56(int256 value) internal pure returns (int56) {
+        require(value >= type(int56).min && value <= type(int56).max, "SafeCast: value doesn't fit in 56 bits");
+        return int56(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int48 from int256, reverting on
+     * overflow (when the input is less than smallest int48 or
+     * greater than largest int48).
+     *
+     * Counterpart to Solidity's `int48` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 48 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt48(int256 value) internal pure returns (int48) {
+        require(value >= type(int48).min && value <= type(int48).max, "SafeCast: value doesn't fit in 48 bits");
+        return int48(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int40 from int256, reverting on
+     * overflow (when the input is less than smallest int40 or
+     * greater than largest int40).
+     *
+     * Counterpart to Solidity's `int40` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 40 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt40(int256 value) internal pure returns (int40) {
+        require(value >= type(int40).min && value <= type(int40).max, "SafeCast: value doesn't fit in 40 bits");
+        return int40(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int32 from int256, reverting on
+     * overflow (when the input is less than smallest int32 or
+     * greater than largest int32).
+     *
+     * Counterpart to Solidity's `int32` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 32 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt32(int256 value) internal pure returns (int32) {
+        require(value >= type(int32).min && value <= type(int32).max, "SafeCast: value doesn't fit in 32 bits");
+        return int32(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int24 from int256, reverting on
+     * overflow (when the input is less than smallest int24 or
+     * greater than largest int24).
+     *
+     * Counterpart to Solidity's `int24` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 24 bits
+     *
+     * _Available since v4.7._
+     */
+    function toInt24(int256 value) internal pure returns (int24) {
+        require(value >= type(int24).min && value <= type(int24).max, "SafeCast: value doesn't fit in 24 bits");
+        return int24(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int16 from int256, reverting on
+     * overflow (when the input is less than smallest int16 or
+     * greater than largest int16).
+     *
+     * Counterpart to Solidity's `int16` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 16 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt16(int256 value) internal pure returns (int16) {
+        require(value >= type(int16).min && value <= type(int16).max, "SafeCast: value doesn't fit in 16 bits");
+        return int16(value);
+    }
+
+    /**
+     * @dev Returns the downcasted int8 from int256, reverting on
+     * overflow (when the input is less than smallest int8 or
+     * greater than largest int8).
+     *
+     * Counterpart to Solidity's `int8` operator.
+     *
+     * Requirements:
+     *
+     * - input must fit into 8 bits
+     *
+     * _Available since v3.1._
+     */
+    function toInt8(int256 value) internal pure returns (int8) {
+        require(value >= type(int8).min && value <= type(int8).max, "SafeCast: value doesn't fit in 8 bits");
+        return int8(value);
+    }
+
+    /**
+     * @dev Converts an unsigned uint256 into a signed int256.
+     *
+     * Requirements:
+     *
+     * - input must be less than or equal to maxInt256.
+     *
+     * _Available since v3.0._
+     */
+    function toInt256(uint256 value) internal pure returns (int256) {
+        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive
+        require(value <= uint256(type(int256).max), "SafeCast: value doesn't fit in an int256");
+        return int256(value);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (utils/structs/DoubleEndedQueue.sol)
+pragma solidity ^0.8.4;
+
+import "../math/SafeCastUpgradeable.sol";
+
+/**
+ * @dev A sequence of items with the ability to efficiently push and pop items (i.e. insert and remove) on both ends of
+ * the sequence (called front and back). Among other access patterns, it can be used to implement efficient LIFO and
+ * FIFO queues. Storage use is optimized, and all operations are O(1) constant time. This includes {clear}, given that
+ * the existing queue contents are left in storage.
+ *
+ * The struct is called `Bytes32Deque`. Other types can be cast to and from `bytes32`. This data structure can only be
+ * used in storage, and not in memory.
+ * ```
+ * DoubleEndedQueue.Bytes32Deque queue;
+ * ```
+ *
+ * _Available since v4.6._
+ */
+library DoubleEndedQueueUpgradeable {
+    /**
+     * @dev An operation (e.g. {front}) couldn't be completed due to the queue being empty.
+     */
+    error Empty();
+
+    /**
+     * @dev An operation (e.g. {at}) couldn't be completed due to an index being out of bounds.
+     */
+    error OutOfBounds();
+
+    /**
+     * @dev Indices are signed integers because the queue can grow in any direction. They are 128 bits so begin and end
+     * are packed in a single storage slot for efficient access. Since the items are added one at a time we can safely
+     * assume that these 128-bit indices will not overflow, and use unchecked arithmetic.
+     *
+     * Struct members have an underscore prefix indicating that they are "private" and should not be read or written to
+     * directly. Use the functions provided below instead. Modifying the struct manually may violate assumptions and
+     * lead to unexpected behavior.
+     *
+     * Indices are in the range [begin, end) which means the first item is at data[begin] and the last item is at
+     * data[end - 1].
+     */
+    struct Bytes32Deque {
+        int128 _begin;
+        int128 _end;
+        mapping(int128 => bytes32) _data;
+    }
+
+    /**
+     * @dev Inserts an item at the end of the queue.
+     */
+    function pushBack(Bytes32Deque storage deque, bytes32 value) internal {
+        int128 backIndex = deque._end;
+        deque._data[backIndex] = value;
+        unchecked {
+            deque._end = backIndex + 1;
+        }
+    }
+
+    /**
+     * @dev Removes the item at the end of the queue and returns it.
+     *
+     * Reverts with `Empty` if the queue is empty.
+     */
+    function popBack(Bytes32Deque storage deque) internal returns (bytes32 value) {
+        if (empty(deque)) revert Empty();
+        int128 backIndex;
+        unchecked {
+            backIndex = deque._end - 1;
+        }
+        value = deque._data[backIndex];
+        delete deque._data[backIndex];
+        deque._end = backIndex;
+    }
+
+    /**
+     * @dev Inserts an item at the beginning of the queue.
+     */
+    function pushFront(Bytes32Deque storage deque, bytes32 value) internal {
+        int128 frontIndex;
+        unchecked {
+            frontIndex = deque._begin - 1;
+        }
+        deque._data[frontIndex] = value;
+        deque._begin = frontIndex;
+    }
+
+    /**
+     * @dev Removes the item at the beginning of the queue and returns it.
+     *
+     * Reverts with `Empty` if the queue is empty.
+     */
+    function popFront(Bytes32Deque storage deque) internal returns (bytes32 value) {
+        if (empty(deque)) revert Empty();
+        int128 frontIndex = deque._begin;
+        value = deque._data[frontIndex];
+        delete deque._data[frontIndex];
+        unchecked {
+            deque._begin = frontIndex + 1;
+        }
+    }
+
+    /**
+     * @dev Returns the item at the beginning of the queue.
+     *
+     * Reverts with `Empty` if the queue is empty.
+     */
+    function front(Bytes32Deque storage deque) internal view returns (bytes32 value) {
+        if (empty(deque)) revert Empty();
+        int128 frontIndex = deque._begin;
+        return deque._data[frontIndex];
+    }
+
+    /**
+     * @dev Returns the item at the end of the queue.
+     *
+     * Reverts with `Empty` if the queue is empty.
+     */
+    function back(Bytes32Deque storage deque) internal view returns (bytes32 value) {
+        if (empty(deque)) revert Empty();
+        int128 backIndex;
+        unchecked {
+            backIndex = deque._end - 1;
+        }
+        return deque._data[backIndex];
+    }
+
+    /**
+     * @dev Return the item at a position in the queue given by `index`, with the first item at 0 and last item at
+     * `length(deque) - 1`.
+     *
+     * Reverts with `OutOfBounds` if the index is out of bounds.
+     */
+    function at(Bytes32Deque storage deque, uint256 index) internal view returns (bytes32 value) {
+        // int256(deque._begin) is a safe upcast
+        int128 idx = SafeCastUpgradeable.toInt128(int256(deque._begin) + SafeCastUpgradeable.toInt256(index));
+        if (idx >= deque._end) revert OutOfBounds();
+        return deque._data[idx];
+    }
+
+    /**
+     * @dev Resets the queue back to being empty.
+     *
+     * NOTE: The current items are left behind in storage. This does not affect the functioning of the queue, but misses
+     * out on potential gas refunds.
+     */
+    function clear(Bytes32Deque storage deque) internal {
+        deque._begin = 0;
+        deque._end = 0;
+    }
+
+    /**
+     * @dev Returns the number of items in the queue.
+     */
+    function length(Bytes32Deque storage deque) internal view returns (uint256) {
+        // The interface preserves the invariant that begin <= end so we assume this will not overflow.
+        // We also assume there are at most int256.max items in the queue.
+        unchecked {
+            return uint256(int256(deque._end) - int256(deque._begin));
+        }
+    }
+
+    /**
+     * @dev Returns true if the queue is empty.
+     */
+    function empty(Bytes32Deque storage deque) internal view returns (bool) {
+        return deque._end <= deque._begin;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Timers.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Tooling for timepoints, timers and delays
+ */
+library TimersUpgradeable {
+    struct Timestamp {
+        uint64 _deadline;
+    }
+
+    function getDeadline(Timestamp memory timer) internal pure returns (uint64) {
+        return timer._deadline;
+    }
+
+    function setDeadline(Timestamp storage timer, uint64 timestamp) internal {
+        timer._deadline = timestamp;
+    }
+
+    function reset(Timestamp storage timer) internal {
+        timer._deadline = 0;
+    }
+
+    function isUnset(Timestamp memory timer) internal pure returns (bool) {
+        return timer._deadline == 0;
+    }
+
+    function isStarted(Timestamp memory timer) internal pure returns (bool) {
+        return timer._deadline > 0;
+    }
+
+    function isPending(Timestamp memory timer) internal view returns (bool) {
+        return timer._deadline > block.timestamp;
+    }
+
+    function isExpired(Timestamp memory timer) internal view returns (bool) {
+        return isStarted(timer) && timer._deadline <= block.timestamp;
+    }
+
+    struct BlockNumber {
+        uint64 _deadline;
+    }
+
+    function getDeadline(BlockNumber memory timer) internal pure returns (uint64) {
+        return timer._deadline;
+    }
+
+    function setDeadline(BlockNumber storage timer, uint64 timestamp) internal {
+        timer._deadline = timestamp;
+    }
+
+    function reset(BlockNumber storage timer) internal {
+        timer._deadline = 0;
+    }
+
+    function isUnset(BlockNumber memory timer) internal pure returns (bool) {
+        return timer._deadline == 0;
+    }
+
+    function isStarted(BlockNumber memory timer) internal pure returns (bool) {
+        return timer._deadline > 0;
+    }
+
+    function isPending(BlockNumber memory timer) internal view returns (bool) {
+        return timer._deadline > block.number;
+    }
+
+    function isExpired(BlockNumber memory timer) internal view returns (bool) {
+        return isStarted(timer) && timer._deadline <= block.number;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.2) (governance/IGovernor.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/introspection/ERC165Upgradeable.sol";
+import "../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Interface of the {Governor} core.
+ *
+ * _Available since v4.3._
+ */
+abstract contract IGovernorUpgradeable is Initializable, IERC165Upgradeable {
+    function __IGovernor_init() internal onlyInitializing {
+    }
+
+    function __IGovernor_init_unchained() internal onlyInitializing {
+    }
+    enum ProposalState {
+        Pending,
+        Active,
+        Canceled,
+        Defeated,
+        Succeeded,
+        Queued,
+        Expired,
+        Executed
+    }
+
+    /**
+     * @dev Emitted when a proposal is created.
+     */
+    event ProposalCreated(
+        uint256 proposalId,
+        address proposer,
+        address[] targets,
+        uint256[] values,
+        string[] signatures,
+        bytes[] calldatas,
+        uint256 startBlock,
+        uint256 endBlock,
+        string description
+    );
+
+    /**
+     * @dev Emitted when a proposal is canceled.
+     */
+    event ProposalCanceled(uint256 proposalId);
+
+    /**
+     * @dev Emitted when a proposal is executed.
+     */
+    event ProposalExecuted(uint256 proposalId);
+
+    /**
+     * @dev Emitted when a vote is cast without params.
+     *
+     * Note: `support` values should be seen as buckets. Their interpretation depends on the voting module used.
+     */
+    event VoteCast(address indexed voter, uint256 proposalId, uint8 support, uint256 weight, string reason);
+
+    /**
+     * @dev Emitted when a vote is cast with params.
+     *
+     * Note: `support` values should be seen as buckets. Their interpretation depends on the voting module used.
+     * `params` are additional encoded parameters. Their intepepretation also depends on the voting module used.
+     */
+    event VoteCastWithParams(
+        address indexed voter,
+        uint256 proposalId,
+        uint8 support,
+        uint256 weight,
+        string reason,
+        bytes params
+    );
+
+    /**
+     * @notice module:core
+     * @dev Name of the governor instance (used in building the ERC712 domain separator).
+     */
+    function name() public view virtual returns (string memory);
+
+    /**
+     * @notice module:core
+     * @dev Version of the governor instance (used in building the ERC712 domain separator). Default: "1"
+     */
+    function version() public view virtual returns (string memory);
+
+    /**
+     * @notice module:voting
+     * @dev A description of the possible `support` values for {castVote} and the way these votes are counted, meant to
+     * be consumed by UIs to show correct vote options and interpret the results. The string is a URL-encoded sequence of
+     * key-value pairs that each describe one aspect, for example `support=bravo&quorum=for,abstain`.
+     *
+     * There are 2 standard keys: `support` and `quorum`.
+     *
+     * - `support=bravo` refers to the vote options 0 = Against, 1 = For, 2 = Abstain, as in `GovernorBravo`.
+     * - `quorum=bravo` means that only For votes are counted towards quorum.
+     * - `quorum=for,abstain` means that both For and Abstain votes are counted towards quorum.
+     *
+     * If a counting module makes use of encoded `params`, it should  include this under a `params` key with a unique
+     * name that describes the behavior. For example:
+     *
+     * - `params=fractional` might refer to a scheme where votes are divided fractionally between for/against/abstain.
+     * - `params=erc721` might refer to a scheme where specific NFTs are delegated to vote.
+     *
+     * NOTE: The string can be decoded by the standard
+     * https://developer.mozilla.org/en-US/docs/Web/API/URLSearchParams[`URLSearchParams`]
+     * JavaScript class.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function COUNTING_MODE() public pure virtual returns (string memory);
+
+    /**
+     * @notice module:core
+     * @dev Hashing function used to (re)build the proposal id from the proposal details..
+     */
+    function hashProposal(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public pure virtual returns (uint256);
+
+    /**
+     * @notice module:core
+     * @dev Current state of a proposal, following Compound's convention
+     */
+    function state(uint256 proposalId) public view virtual returns (ProposalState);
+
+    /**
+     * @notice module:core
+     * @dev Block number used to retrieve user's votes and quorum. As per Compound's Comp and OpenZeppelin's
+     * ERC20Votes, the snapshot is performed at the end of this block. Hence, voting for this proposal starts at the
+     * beginning of the following block.
+     */
+    function proposalSnapshot(uint256 proposalId) public view virtual returns (uint256);
+
+    /**
+     * @notice module:core
+     * @dev Block number at which votes close. Votes close at the end of this block, so it is possible to cast a vote
+     * during this block.
+     */
+    function proposalDeadline(uint256 proposalId) public view virtual returns (uint256);
+
+    /**
+     * @notice module:user-config
+     * @dev Delay, in number of block, between the proposal is created and the vote starts. This can be increassed to
+     * leave time for users to buy voting power, or delegate it, before the voting of a proposal starts.
+     */
+    function votingDelay() public view virtual returns (uint256);
+
+    /**
+     * @notice module:user-config
+     * @dev Delay, in number of blocks, between the vote start and vote ends.
+     *
+     * NOTE: The {votingDelay} can delay the start of the vote. This must be considered when setting the voting
+     * duration compared to the voting delay.
+     */
+    function votingPeriod() public view virtual returns (uint256);
+
+    /**
+     * @notice module:user-config
+     * @dev Minimum number of cast voted required for a proposal to be successful.
+     *
+     * Note: The `blockNumber` parameter corresponds to the snapshot used for counting vote. This allows to scale the
+     * quorum depending on values such as the totalSupply of a token at this block (see {ERC20Votes}).
+     */
+    function quorum(uint256 blockNumber) public view virtual returns (uint256);
+
+    /**
+     * @notice module:reputation
+     * @dev Voting power of an `account` at a specific `blockNumber`.
+     *
+     * Note: this can be implemented in a number of ways, for example by reading the delegated balance from one (or
+     * multiple), {ERC20Votes} tokens.
+     */
+    function getVotes(address account, uint256 blockNumber) public view virtual returns (uint256);
+
+    /**
+     * @notice module:reputation
+     * @dev Voting power of an `account` at a specific `blockNumber` given additional encoded parameters.
+     */
+    function getVotesWithParams(
+        address account,
+        uint256 blockNumber,
+        bytes memory params
+    ) public view virtual returns (uint256);
+
+    /**
+     * @notice module:voting
+     * @dev Returns weither `account` has cast a vote on `proposalId`.
+     */
+    function hasVoted(uint256 proposalId, address account) public view virtual returns (bool);
+
+    /**
+     * @dev Create a new proposal. Vote start {IGovernor-votingDelay} blocks after the proposal is created and ends
+     * {IGovernor-votingPeriod} blocks after the voting starts.
+     *
+     * Emits a {ProposalCreated} event.
+     */
+    function propose(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        string memory description
+    ) public virtual returns (uint256 proposalId);
+
+    /**
+     * @dev Execute a successful proposal. This requires the quorum to be reached, the vote to be successful, and the
+     * deadline to be reached.
+     *
+     * Emits a {ProposalExecuted} event.
+     *
+     * Note: some module can modify the requirements for execution, for example by adding an additional timelock.
+     */
+    function execute(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public payable virtual returns (uint256 proposalId);
+
+    /**
+     * @dev Cast a vote
+     *
+     * Emits a {VoteCast} event.
+     */
+    function castVote(uint256 proposalId, uint8 support) public virtual returns (uint256 balance);
+
+    /**
+     * @dev Cast a vote with a reason
+     *
+     * Emits a {VoteCast} event.
+     */
+    function castVoteWithReason(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason
+    ) public virtual returns (uint256 balance);
+
+    /**
+     * @dev Cast a vote with a reason and additional encoded parameters
+     *
+     * Emits a {VoteCast} or {VoteCastWithParams} event depending on the length of params.
+     */
+    function castVoteWithReasonAndParams(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params
+    ) public virtual returns (uint256 balance);
+
+    /**
+     * @dev Cast a vote using the user's cryptographic signature.
+     *
+     * Emits a {VoteCast} event.
+     */
+    function castVoteBySig(
+        uint256 proposalId,
+        uint8 support,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual returns (uint256 balance);
+
+    /**
+     * @dev Cast a vote with a reason and additional encoded parameters using the user's cryptographic signature.
+     *
+     * Emits a {VoteCast} or {VoteCastWithParams} event depending on the length of params.
+     */
+    function castVoteWithReasonAndParamsBySig(
+        uint256 proposalId,
+        uint8 support,
+        string calldata reason,
+        bytes memory params,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) public virtual returns (uint256 balance);
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (governance/extensions/GovernorTimelockControl.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IGovernorTimelockUpgradeable.sol";
+import "../GovernorUpgradeable.sol";
+import "../TimelockControllerUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of {Governor} that binds the execution process to an instance of {TimelockController}. This adds a
+ * delay, enforced by the {TimelockController} to all successful proposal (in addition to the voting duration). The
+ * {Governor} needs the proposer (and ideally the executor) roles for the {Governor} to work properly.
+ *
+ * Using this model means the proposal will be operated by the {TimelockController} and not by the {Governor}. Thus,
+ * the assets and permissions must be attached to the {TimelockController}. Any asset sent to the {Governor} will be
+ * inaccessible.
+ *
+ * WARNING: Setting up the TimelockController to have additional proposers besides the governor is very risky, as it
+ * grants them powers that they must be trusted or known not to use: 1) {onlyGovernance} functions like {relay} are
+ * available to them through the timelock, and 2) approved governance proposals can be blocked by them, effectively
+ * executing a Denial of Service attack. This risk will be mitigated in a future release.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorTimelockControlUpgradeable is Initializable, IGovernorTimelockUpgradeable, GovernorUpgradeable {
+    TimelockControllerUpgradeable private _timelock;
+    mapping(uint256 => bytes32) private _timelockIds;
+
+    /**
+     * @dev Emitted when the timelock controller used for proposal execution is modified.
+     */
+    event TimelockChange(address oldTimelock, address newTimelock);
+
+    /**
+     * @dev Set the timelock.
+     */
+    function __GovernorTimelockControl_init(TimelockControllerUpgradeable timelockAddress) internal onlyInitializing {
+        __GovernorTimelockControl_init_unchained(timelockAddress);
+    }
+
+    function __GovernorTimelockControl_init_unchained(TimelockControllerUpgradeable timelockAddress) internal onlyInitializing {
+        _updateTimelock(timelockAddress);
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165Upgradeable, GovernorUpgradeable) returns (bool) {
+        return interfaceId == type(IGovernorTimelockUpgradeable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev Overridden version of the {Governor-state} function with added support for the `Queued` status.
+     */
+    function state(uint256 proposalId) public view virtual override(IGovernorUpgradeable, GovernorUpgradeable) returns (ProposalState) {
+        ProposalState status = super.state(proposalId);
+
+        if (status != ProposalState.Succeeded) {
+            return status;
+        }
+
+        // core tracks execution, so we just have to check if successful proposal have been queued.
+        bytes32 queueid = _timelockIds[proposalId];
+        if (queueid == bytes32(0)) {
+            return status;
+        } else if (_timelock.isOperationDone(queueid)) {
+            return ProposalState.Executed;
+        } else if (_timelock.isOperationPending(queueid)) {
+            return ProposalState.Queued;
+        } else {
+            return ProposalState.Canceled;
+        }
+    }
+
+    /**
+     * @dev Public accessor to check the address of the timelock
+     */
+    function timelock() public view virtual override returns (address) {
+        return address(_timelock);
+    }
+
+    /**
+     * @dev Public accessor to check the eta of a queued proposal
+     */
+    function proposalEta(uint256 proposalId) public view virtual override returns (uint256) {
+        uint256 eta = _timelock.getTimestamp(_timelockIds[proposalId]);
+        return eta == 1 ? 0 : eta; // _DONE_TIMESTAMP (1) should be replaced with a 0 value
+    }
+
+    /**
+     * @dev Function to queue a proposal to the timelock.
+     */
+    function queue(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public virtual override returns (uint256) {
+        uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
+
+        require(state(proposalId) == ProposalState.Succeeded, "Governor: proposal not successful");
+
+        uint256 delay = _timelock.getMinDelay();
+        _timelockIds[proposalId] = _timelock.hashOperationBatch(targets, values, calldatas, 0, descriptionHash);
+        _timelock.scheduleBatch(targets, values, calldatas, 0, descriptionHash, delay);
+
+        emit ProposalQueued(proposalId, block.timestamp + delay);
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Overridden execute function that run the already queued proposal through the timelock.
+     */
+    function _execute(
+        uint256, /* proposalId */
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual override {
+        _timelock.executeBatch{value: msg.value}(targets, values, calldatas, 0, descriptionHash);
+    }
+
+    /**
+     * @dev Overridden version of the {Governor-_cancel} function to cancel the timelocked proposal if it as already
+     * been queued.
+     */
+    // This function can reenter through the external call to the timelock, but we assume the timelock is trusted and
+    // well behaved (according to TimelockController) and this will not happen.
+    // slither-disable-next-line reentrancy-no-eth
+    function _cancel(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) internal virtual override returns (uint256) {
+        uint256 proposalId = super._cancel(targets, values, calldatas, descriptionHash);
+
+        if (_timelockIds[proposalId] != 0) {
+            _timelock.cancel(_timelockIds[proposalId]);
+            delete _timelockIds[proposalId];
+        }
+
+        return proposalId;
+    }
+
+    /**
+     * @dev Address through which the governor executes action. In this case, the timelock.
+     */
+    function _executor() internal view virtual override returns (address) {
+        return address(_timelock);
+    }
+
+    /**
+     * @dev Public endpoint to update the underlying timelock instance. Restricted to the timelock itself, so updates
+     * must be proposed, scheduled, and executed through governance proposals.
+     *
+     * CAUTION: It is not recommended to change the timelock while there are other queued governance proposals.
+     */
+    function updateTimelock(TimelockControllerUpgradeable newTimelock) external virtual onlyGovernance {
+        _updateTimelock(newTimelock);
+    }
+
+    function _updateTimelock(TimelockControllerUpgradeable newTimelock) private {
+        emit TimelockChange(address(_timelock), address(newTimelock));
+        _timelock = newTimelock;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[48] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (governance/extensions/IGovernorTimelock.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IGovernorUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of the {IGovernor} for timelock supporting modules.
+ *
+ * _Available since v4.3._
+ */
+abstract contract IGovernorTimelockUpgradeable is Initializable, IGovernorUpgradeable {
+    function __IGovernorTimelock_init() internal onlyInitializing {
+    }
+
+    function __IGovernorTimelock_init_unchained() internal onlyInitializing {
+    }
+    event ProposalQueued(uint256 proposalId, uint256 eta);
+
+    function timelock() public view virtual returns (address);
+
+    function proposalEta(uint256 proposalId) public view virtual returns (uint256);
+
+    function queue(
+        address[] memory targets,
+        uint256[] memory values,
+        bytes[] memory calldatas,
+        bytes32 descriptionHash
+    ) public virtual returns (uint256 proposalId);
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC1155/ERC1155.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC1155Upgradeable.sol";
+import "./IERC1155ReceiverUpgradeable.sol";
+import "./extensions/IERC1155MetadataURIUpgradeable.sol";
+import "../../utils/AddressUpgradeable.sol";
+import "../../utils/ContextUpgradeable.sol";
+import "../../utils/introspection/ERC165Upgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Implementation of the basic standard multi-token.
+ * See https://eips.ethereum.org/EIPS/eip-1155
+ * Originally based on code by Enjin: https://github.com/enjin/erc-1155
+ *
+ * _Available since v3.1._
+ */
+contract ERC1155Upgradeable is Initializable, ContextUpgradeable, ERC165Upgradeable, IERC1155Upgradeable, IERC1155MetadataURIUpgradeable {
+    using AddressUpgradeable for address;
+
+    // Mapping from token ID to account balances
+    mapping(uint256 => mapping(address => uint256)) private _balances;
+
+    // Mapping from account to operator approvals
+    mapping(address => mapping(address => bool)) private _operatorApprovals;
+
+    // Used as the URI for all token types by relying on ID substitution, e.g. https://token-cdn-domain/{id}.json
+    string private _uri;
+
+    /**
+     * @dev See {_setURI}.
+     */
+    function __ERC1155_init(string memory uri_) internal onlyInitializing {
+        __ERC1155_init_unchained(uri_);
+    }
+
+    function __ERC1155_init_unchained(string memory uri_) internal onlyInitializing {
+        _setURI(uri_);
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165Upgradeable, IERC165Upgradeable) returns (bool) {
+        return
+            interfaceId == type(IERC1155Upgradeable).interfaceId ||
+            interfaceId == type(IERC1155MetadataURIUpgradeable).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /**
+     * @dev See {IERC1155MetadataURI-uri}.
+     *
+     * This implementation returns the same URI for *all* token types. It relies
+     * on the token type ID substitution mechanism
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata[defined in the EIP].
+     *
+     * Clients calling this function must replace the `\{id\}` substring with the
+     * actual token type ID.
+     */
+    function uri(uint256) public view virtual override returns (string memory) {
+        return _uri;
+    }
+
+    /**
+     * @dev See {IERC1155-balanceOf}.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function balanceOf(address account, uint256 id) public view virtual override returns (uint256) {
+        require(account != address(0), "ERC1155: address zero is not a valid owner");
+        return _balances[id][account];
+    }
+
+    /**
+     * @dev See {IERC1155-balanceOfBatch}.
+     *
+     * Requirements:
+     *
+     * - `accounts` and `ids` must have the same length.
+     */
+    function balanceOfBatch(address[] memory accounts, uint256[] memory ids)
+        public
+        view
+        virtual
+        override
+        returns (uint256[] memory)
+    {
+        require(accounts.length == ids.length, "ERC1155: accounts and ids length mismatch");
+
+        uint256[] memory batchBalances = new uint256[](accounts.length);
+
+        for (uint256 i = 0; i < accounts.length; ++i) {
+            batchBalances[i] = balanceOf(accounts[i], ids[i]);
+        }
+
+        return batchBalances;
+    }
+
+    /**
+     * @dev See {IERC1155-setApprovalForAll}.
+     */
+    function setApprovalForAll(address operator, bool approved) public virtual override {
+        _setApprovalForAll(_msgSender(), operator, approved);
+    }
+
+    /**
+     * @dev See {IERC1155-isApprovedForAll}.
+     */
+    function isApprovedForAll(address account, address operator) public view virtual override returns (bool) {
+        return _operatorApprovals[account][operator];
+    }
+
+    /**
+     * @dev See {IERC1155-safeTransferFrom}.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) public virtual override {
+        require(
+            from == _msgSender() || isApprovedForAll(from, _msgSender()),
+            "ERC1155: caller is not token owner nor approved"
+        );
+        _safeTransferFrom(from, to, id, amount, data);
+    }
+
+    /**
+     * @dev See {IERC1155-safeBatchTransferFrom}.
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) public virtual override {
+        require(
+            from == _msgSender() || isApprovedForAll(from, _msgSender()),
+            "ERC1155: caller is not token owner nor approved"
+        );
+        _safeBatchTransferFrom(from, to, ids, amounts, data);
+    }
+
+    /**
+     * @dev Transfers `amount` tokens of token type `id` from `from` to `to`.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of tokens of type `id` of at least `amount`.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function _safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) internal virtual {
+        require(to != address(0), "ERC1155: transfer to the zero address");
+
+        address operator = _msgSender();
+        uint256[] memory ids = _asSingletonArray(id);
+        uint256[] memory amounts = _asSingletonArray(amount);
+
+        _beforeTokenTransfer(operator, from, to, ids, amounts, data);
+
+        uint256 fromBalance = _balances[id][from];
+        require(fromBalance >= amount, "ERC1155: insufficient balance for transfer");
+        unchecked {
+            _balances[id][from] = fromBalance - amount;
+        }
+        _balances[id][to] += amount;
+
+        emit TransferSingle(operator, from, to, id, amount);
+
+        _afterTokenTransfer(operator, from, to, ids, amounts, data);
+
+        _doSafeTransferAcceptanceCheck(operator, from, to, id, amount, data);
+    }
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {_safeTransferFrom}.
+     *
+     * Emits a {TransferBatch} event.
+     *
+     * Requirements:
+     *
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function _safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual {
+        require(ids.length == amounts.length, "ERC1155: ids and amounts length mismatch");
+        require(to != address(0), "ERC1155: transfer to the zero address");
+
+        address operator = _msgSender();
+
+        _beforeTokenTransfer(operator, from, to, ids, amounts, data);
+
+        for (uint256 i = 0; i < ids.length; ++i) {
+            uint256 id = ids[i];
+            uint256 amount = amounts[i];
+
+            uint256 fromBalance = _balances[id][from];
+            require(fromBalance >= amount, "ERC1155: insufficient balance for transfer");
+            unchecked {
+                _balances[id][from] = fromBalance - amount;
+            }
+            _balances[id][to] += amount;
+        }
+
+        emit TransferBatch(operator, from, to, ids, amounts);
+
+        _afterTokenTransfer(operator, from, to, ids, amounts, data);
+
+        _doSafeBatchTransferAcceptanceCheck(operator, from, to, ids, amounts, data);
+    }
+
+    /**
+     * @dev Sets a new URI for all token types, by relying on the token type ID
+     * substitution mechanism
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata[defined in the EIP].
+     *
+     * By this mechanism, any occurrence of the `\{id\}` substring in either the
+     * URI or any of the amounts in the JSON file at said URI will be replaced by
+     * clients with the token type ID.
+     *
+     * For example, the `https://token-cdn-domain/\{id\}.json` URI would be
+     * interpreted by clients as
+     * `https://token-cdn-domain/000000000000000000000000000000000000000000000000000000000004cce0.json`
+     * for token type ID 0x4cce0.
+     *
+     * See {uri}.
+     *
+     * Because these URIs cannot be meaningfully represented by the {URI} event,
+     * this function emits no events.
+     */
+    function _setURI(string memory newuri) internal virtual {
+        _uri = newuri;
+    }
+
+    /**
+     * @dev Creates `amount` tokens of token type `id`, and assigns them to `to`.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function _mint(
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) internal virtual {
+        require(to != address(0), "ERC1155: mint to the zero address");
+
+        address operator = _msgSender();
+        uint256[] memory ids = _asSingletonArray(id);
+        uint256[] memory amounts = _asSingletonArray(amount);
+
+        _beforeTokenTransfer(operator, address(0), to, ids, amounts, data);
+
+        _balances[id][to] += amount;
+        emit TransferSingle(operator, address(0), to, id, amount);
+
+        _afterTokenTransfer(operator, address(0), to, ids, amounts, data);
+
+        _doSafeTransferAcceptanceCheck(operator, address(0), to, id, amount, data);
+    }
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {_mint}.
+     *
+     * Emits a {TransferBatch} event.
+     *
+     * Requirements:
+     *
+     * - `ids` and `amounts` must have the same length.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function _mintBatch(
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual {
+        require(to != address(0), "ERC1155: mint to the zero address");
+        require(ids.length == amounts.length, "ERC1155: ids and amounts length mismatch");
+
+        address operator = _msgSender();
+
+        _beforeTokenTransfer(operator, address(0), to, ids, amounts, data);
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            _balances[ids[i]][to] += amounts[i];
+        }
+
+        emit TransferBatch(operator, address(0), to, ids, amounts);
+
+        _afterTokenTransfer(operator, address(0), to, ids, amounts, data);
+
+        _doSafeBatchTransferAcceptanceCheck(operator, address(0), to, ids, amounts, data);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens of token type `id` from `from`
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `from` must have at least `amount` tokens of token type `id`.
+     */
+    function _burn(
+        address from,
+        uint256 id,
+        uint256 amount
+    ) internal virtual {
+        require(from != address(0), "ERC1155: burn from the zero address");
+
+        address operator = _msgSender();
+        uint256[] memory ids = _asSingletonArray(id);
+        uint256[] memory amounts = _asSingletonArray(amount);
+
+        _beforeTokenTransfer(operator, from, address(0), ids, amounts, "");
+
+        uint256 fromBalance = _balances[id][from];
+        require(fromBalance >= amount, "ERC1155: burn amount exceeds balance");
+        unchecked {
+            _balances[id][from] = fromBalance - amount;
+        }
+
+        emit TransferSingle(operator, from, address(0), id, amount);
+
+        _afterTokenTransfer(operator, from, address(0), ids, amounts, "");
+    }
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {_burn}.
+     *
+     * Emits a {TransferBatch} event.
+     *
+     * Requirements:
+     *
+     * - `ids` and `amounts` must have the same length.
+     */
+    function _burnBatch(
+        address from,
+        uint256[] memory ids,
+        uint256[] memory amounts
+    ) internal virtual {
+        require(from != address(0), "ERC1155: burn from the zero address");
+        require(ids.length == amounts.length, "ERC1155: ids and amounts length mismatch");
+
+        address operator = _msgSender();
+
+        _beforeTokenTransfer(operator, from, address(0), ids, amounts, "");
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            uint256 id = ids[i];
+            uint256 amount = amounts[i];
+
+            uint256 fromBalance = _balances[id][from];
+            require(fromBalance >= amount, "ERC1155: burn amount exceeds balance");
+            unchecked {
+                _balances[id][from] = fromBalance - amount;
+            }
+        }
+
+        emit TransferBatch(operator, from, address(0), ids, amounts);
+
+        _afterTokenTransfer(operator, from, address(0), ids, amounts, "");
+    }
+
+    /**
+     * @dev Approve `operator` to operate on all of `owner` tokens
+     *
+     * Emits an {ApprovalForAll} event.
+     */
+    function _setApprovalForAll(
+        address owner,
+        address operator,
+        bool approved
+    ) internal virtual {
+        require(owner != operator, "ERC1155: setting approval status for self");
+        _operatorApprovals[owner][operator] = approved;
+        emit ApprovalForAll(owner, operator, approved);
+    }
+
+    /**
+     * @dev Hook that is called before any token transfer. This includes minting
+     * and burning, as well as batched variants.
+     *
+     * The same hook is called on both single and batched variants. For single
+     * transfers, the length of the `ids` and `amounts` arrays will be 1.
+     *
+     * Calling conditions (for each `id` and `amount` pair):
+     *
+     * - When `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * of token type `id` will be  transferred to `to`.
+     * - When `from` is zero, `amount` tokens of token type `id` will be minted
+     * for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens of token type `id`
+     * will be burned.
+     * - `from` and `to` are never both zero.
+     * - `ids` and `amounts` have the same, non-zero length.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any token transfer. This includes minting
+     * and burning, as well as batched variants.
+     *
+     * The same hook is called on both single and batched variants. For single
+     * transfers, the length of the `id` and `amount` arrays will be 1.
+     *
+     * Calling conditions (for each `id` and `amount` pair):
+     *
+     * - When `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * of token type `id` will be  transferred to `to`.
+     * - When `from` is zero, `amount` tokens of token type `id` will be minted
+     * for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens of token type `id`
+     * will be burned.
+     * - `from` and `to` are never both zero.
+     * - `ids` and `amounts` have the same, non-zero length.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual {}
+
+    function _doSafeTransferAcceptanceCheck(
+        address operator,
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) private {
+        if (to.isContract()) {
+            try IERC1155ReceiverUpgradeable(to).onERC1155Received(operator, from, id, amount, data) returns (bytes4 response) {
+                if (response != IERC1155ReceiverUpgradeable.onERC1155Received.selector) {
+                    revert("ERC1155: ERC1155Receiver rejected tokens");
+                }
+            } catch Error(string memory reason) {
+                revert(reason);
+            } catch {
+                revert("ERC1155: transfer to non ERC1155Receiver implementer");
+            }
+        }
+    }
+
+    function _doSafeBatchTransferAcceptanceCheck(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) private {
+        if (to.isContract()) {
+            try IERC1155ReceiverUpgradeable(to).onERC1155BatchReceived(operator, from, ids, amounts, data) returns (
+                bytes4 response
+            ) {
+                if (response != IERC1155ReceiverUpgradeable.onERC1155BatchReceived.selector) {
+                    revert("ERC1155: ERC1155Receiver rejected tokens");
+                }
+            } catch Error(string memory reason) {
+                revert(reason);
+            } catch {
+                revert("ERC1155: transfer to non ERC1155Receiver implementer");
+            }
+        }
+    }
+
+    function _asSingletonArray(uint256 element) private pure returns (uint256[] memory) {
+        uint256[] memory array = new uint256[](1);
+        array[0] = element;
+
+        return array;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[47] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (token/ERC1155/IERC1155.sol)
+
+pragma solidity ^0.8.0;
+
+import "../../utils/introspection/IERC165Upgradeable.sol";
+
+/**
+ * @dev Required interface of an ERC1155 compliant contract, as defined in the
+ * https://eips.ethereum.org/EIPS/eip-1155[EIP].
+ *
+ * _Available since v3.1._
+ */
+interface IERC1155Upgradeable is IERC165Upgradeable {
+    /**
+     * @dev Emitted when `value` tokens of token type `id` are transferred from `from` to `to` by `operator`.
+     */
+    event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
+
+    /**
+     * @dev Equivalent to multiple {TransferSingle} events, where `operator`, `from` and `to` are the same for all
+     * transfers.
+     */
+    event TransferBatch(
+        address indexed operator,
+        address indexed from,
+        address indexed to,
+        uint256[] ids,
+        uint256[] values
+    );
+
+    /**
+     * @dev Emitted when `account` grants or revokes permission to `operator` to transfer their tokens, according to
+     * `approved`.
+     */
+    event ApprovalForAll(address indexed account, address indexed operator, bool approved);
+
+    /**
+     * @dev Emitted when the URI for token type `id` changes to `value`, if it is a non-programmatic URI.
+     *
+     * If an {URI} event was emitted for `id`, the standard
+     * https://eips.ethereum.org/EIPS/eip-1155#metadata-extensions[guarantees] that `value` will equal the value
+     * returned by {IERC1155MetadataURI-uri}.
+     */
+    event URI(string value, uint256 indexed id);
+
+    /**
+     * @dev Returns the amount of tokens of token type `id` owned by `account`.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {balanceOf}.
+     *
+     * Requirements:
+     *
+     * - `accounts` and `ids` must have the same length.
+     */
+    function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids)
+        external
+        view
+        returns (uint256[] memory);
+
+    /**
+     * @dev Grants or revokes permission to `operator` to transfer the caller's tokens, according to `approved`,
+     *
+     * Emits an {ApprovalForAll} event.
+     *
+     * Requirements:
+     *
+     * - `operator` cannot be the caller.
+     */
+    function setApprovalForAll(address operator, bool approved) external;
+
+    /**
+     * @dev Returns true if `operator` is approved to transfer ``account``'s tokens.
+     *
+     * See {setApprovalForAll}.
+     */
+    function isApprovedForAll(address account, address operator) external view returns (bool);
+
+    /**
+     * @dev Transfers `amount` tokens of token type `id` from `from` to `to`.
+     *
+     * Emits a {TransferSingle} event.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - If the caller is not `from`, it must have been approved to spend ``from``'s tokens via {setApprovalForAll}.
+     * - `from` must have a balance of tokens of type `id` of at least `amount`.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155Received} and return the
+     * acceptance magic value.
+     */
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes calldata data
+    ) external;
+
+    /**
+     * @dev xref:ROOT:erc1155.adoc#batch-operations[Batched] version of {safeTransferFrom}.
+     *
+     * Emits a {TransferBatch} event.
+     *
+     * Requirements:
+     *
+     * - `ids` and `amounts` must have the same length.
+     * - If `to` refers to a smart contract, it must implement {IERC1155Receiver-onERC1155BatchReceived} and return the
+     * acceptance magic value.
+     */
+    function safeBatchTransferFrom(
+        address from,
+        address to,
+        uint256[] calldata ids,
+        uint256[] calldata amounts,
+        bytes calldata data
+    ) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC1155/extensions/IERC1155MetadataURI.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC1155Upgradeable.sol";
+
+/**
+ * @dev Interface of the optional ERC1155MetadataExtension interface, as defined
+ * in the https://eips.ethereum.org/EIPS/eip-1155#metadata-extensions[EIP].
+ *
+ * _Available since v3.1._
+ */
+interface IERC1155MetadataURIUpgradeable is IERC1155Upgradeable {
+    /**
+     * @dev Returns the URI for token type `id`.
+     *
+     * If the `\{id\}` substring is present in the URI, it must be replaced by
+     * clients with the actual token type ID.
+     */
+    function uri(uint256 id) external view returns (string memory);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC1155/extensions/ERC1155Supply.sol)
+
+pragma solidity ^0.8.0;
+
+import "../ERC1155Upgradeable.sol";
+import "../../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of ERC1155 that adds tracking of total supply per id.
+ *
+ * Useful for scenarios where Fungible and Non-fungible tokens have to be
+ * clearly identified. Note: While a totalSupply of 1 might mean the
+ * corresponding is an NFT, there is no guarantees that no other token with the
+ * same id are not going to be minted.
+ */
+abstract contract ERC1155SupplyUpgradeable is Initializable, ERC1155Upgradeable {
+    function __ERC1155Supply_init() internal onlyInitializing {
+    }
+
+    function __ERC1155Supply_init_unchained() internal onlyInitializing {
+    }
+    mapping(uint256 => uint256) private _totalSupply;
+
+    /**
+     * @dev Total amount of tokens in with a given id.
+     */
+    function totalSupply(uint256 id) public view virtual returns (uint256) {
+        return _totalSupply[id];
+    }
+
+    /**
+     * @dev Indicates whether any token exist with a given id, or not.
+     */
+    function exists(uint256 id) public view virtual returns (bool) {
+        return ERC1155SupplyUpgradeable.totalSupply(id) > 0;
+    }
+
+    /**
+     * @dev See {ERC1155-_beforeTokenTransfer}.
+     */
+    function _beforeTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal virtual override {
+        super._beforeTokenTransfer(operator, from, to, ids, amounts, data);
+
+        if (from == address(0)) {
+            for (uint256 i = 0; i < ids.length; ++i) {
+                _totalSupply[ids[i]] += amounts[i];
+            }
+        }
+
+        if (to == address(0)) {
+            for (uint256 i = 0; i < ids.length; ++i) {
+                uint256 id = ids[i];
+                uint256 amount = amounts[i];
+                uint256 supply = _totalSupply[id];
+                require(supply >= amount, "ERC1155: burn amount exceeds totalSupply");
+                unchecked {
+                    _totalSupply[id] = supply - amount;
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+import "../../interfaces/IPlushVestingPool.sol";
+
+import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+contract PlushVestingPool is
+    IPlushVestingPool,
+    Initializable,
+    AccessControlUpgradeable,
+    UUPSUpgradeable
+{
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
+    IERC20Upgradeable public plush;
+
+    uint256 private mainPercent; //Percent release at IDO
+
+    uint256 private daysUnlock; //How many days will it be unlocked
+    uint256 private amountDaily; //Number of tokens broken into pieces
+
+    uint256 private unlockBalance; //Number of tokens available for withdrawal (release at IDO)
+    uint256 private timeStart; //Start counter start after (release at IDO)
+    uint256 private timeRemuneration; //The time when the next part of the tokens will be unlocked
+
+    bool private isIDO;
+
+    /**
+     * @dev Roles definitions
+     */
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant WITHDRAW_ROLE = keccak256("WITHDRAW_ROLE");
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(
+        IERC20Upgradeable _plush,
+        uint256 _mainPercent,
+        uint256 _daysUnlock
+    ) public initializer {
+        plush = _plush;
+        mainPercent = _mainPercent;
+        daysUnlock = _daysUnlock;
+        isIDO = false;
+        timeRemuneration = 1 days;
+
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(UPGRADER_ROLE, msg.sender);
+        _grantRole(WITHDRAW_ROLE, msg.sender);
+    }
+
+    /**
+     * @notice Returns how many tokens are locked
+     * @return Number of tokens in wei
+     */
+    function getLockBalance() public view returns(uint256) {
+        if(isIDO){
+            uint256 amountUnlockRemuneration = 0;
+
+            for (
+                uint256 i = 0;
+                i < (block.timestamp - timeStart) / timeRemuneration;
+                i++
+            ) {
+                amountUnlockRemuneration += amountDaily;
+            }
+
+            if (
+                unlockBalance + amountUnlockRemuneration >
+                plush.balanceOf(address(this))
+            ) {
+                return 0;
+            } else {
+                return
+                    plush.balanceOf(address(this)) -
+                    (unlockBalance + amountUnlockRemuneration);
+            }
+        } else {
+            return plush.balanceOf(address(this));
+        }
+    }
+
+    /**
+     * @notice Returns how many tokens are unlock
+     * @return Number of tokens in wei
+     */
+    function getUnLockBalance() public view returns(uint256) {
+        if(isIDO){
+            uint256 amountUnlockRemuneration = 0;
+
+            for (
+                uint256 i = 0;
+                i < (block.timestamp - timeStart) / timeRemuneration;
+                i++
+            ) {
+                amountUnlockRemuneration += amountDaily;
+            }
+
+            if (
+                unlockBalance + amountUnlockRemuneration >
+                plush.balanceOf(address(this))
+            ) {
+                return plush.balanceOf(address(this));
+            } else {
+                return unlockBalance + amountUnlockRemuneration;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Withdrawal of unlocked tokens
+     */
+    function withdraw() external onlyRole(WITHDRAW_ROLE) {
+        require(getUnLockBalance() > 0, "Insufficient funds");
+
+        uint256 unlockBalanceTemp = getUnLockBalance();
+        uint256 timePast = block.timestamp - timeStart;
+
+        unlockBalance = 0;
+
+        while(timePast > timeRemuneration){
+            timePast -= timeRemuneration;
+        }
+
+        timeStart = block.timestamp - timePast;
+        plush.safeTransfer(msg.sender, unlockBalanceTemp);
+
+        emit WithdrawalTokens(msg.sender, unlockBalanceTemp);
+    }
+
+    /**
+     * @notice Start release at IDO (unlocking the first part of the tokens and starting the reward every day)
+     */
+    function releaseAtIDO() external onlyRole(OPERATOR_ROLE) {
+        require(!isIDO, "Already complete");
+
+        unlockBalance = (plush.balanceOf(address(this)) * mainPercent) / 100000;
+        amountDaily =
+            (plush.balanceOf(address(this)) - unlockBalance) /
+            daysUnlock;
+        timeStart = block.timestamp;
+        isIDO = true;
+
+        emit ReleaseIDO(msg.sender, timeStart);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyRole(UPGRADER_ROLE)
+    {}
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushVestingPool {
+    /**
+     * @notice Returns how many tokens are locked
+     * @return Number of tokens in wei
+     */
+    function getLockBalance() external view returns (uint256);
+
+    /**
+     * @notice Returns how many tokens are unlock
+     * @return Number of tokens in wei
+     */
+    function getUnLockBalance() external view returns (uint256);
+
+    /**
+     * @notice Withdrawal of unlocked tokens
+     */
+    function withdraw() external;
+
+    /**
+     * @notice Start release at IDO (unlocking the first part of the tokens and starting the reward every day)
+     */
+    function releaseAtIDO() external;
+
+    /// @notice Emitted when user withdrawal unlocked tokens
+    event WithdrawalTokens(address indexed receiver, uint256 amount);
+
+    /// @notice Emitted when release at IDO
+    event ReleaseIDO(address indexed receiver, uint256 time);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.3;
+
+interface IPlushFaucet {
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /// @notice Get tokens from faucet
+    function send() external;
+
+    /**
+     * @notice Set ERC-20 faucet token
+     * @param newAddress contract address of new token
+     */
+    function setTokenAddress(address newAddress) external;
+
+    /**
+     * @notice Set faucet drip amount
+     * @param amount new faucet drip amount
+     */
+    function setFaucetDripAmount(uint256 amount) external;
+
+    /**
+     * @notice Set the maximum amount of tokens that a user can receive for the entire time
+     * @param amount new maximum amount
+     */
+    function setMaxReceiveAmount(uint256 amount) external;
+
+    /**
+     * @notice Set the time after which the user will be able to use the faucet
+     * @param time new faucet time limit in seconds (timestamp)
+     */
+    function setFaucetTimeLimit(uint256 time) external;
+
+    /// @notice Enable the LifeSpan NFT check for using the faucet
+    function setEnableNFTCheck() external;
+
+    /// @notice Disable the LifeSpan NFT check for using the faucet
+    function setDisableNFTCheck() external;
+
+    /**
+     * @notice Withdraw the required number of tokens from the faucet
+     * @param amount required token amount (ERC-20)
+     * @param receiver address of the tokens recipient
+     */
+    function withdraw(uint256 amount, address receiver) external;
+
+    /**
+     * @notice Return how many tokens a user can get in total for the entire time
+     * @return number of tokens in wei
+     */
+    function getMaxReceiveAmount() external view returns (uint256);
+
+    /**
+     * @notice Return how many tokens you can get at one time
+     * @return number of tokens in wei
+     */
+    function getFaucetDripAmount() external view returns (uint256);
+
+    /**
+     * @notice Return the faucet balance
+     * @return number of tokens in wei
+     */
+    function getFaucetBalance() external view returns (uint256);
+
+    /**
+     * @notice Return the time limit between interaction with the faucet
+     * @return number of seconds (timestamp)
+     */
+    function getTimeLimit() external view returns (uint256);
+
+    /**
+     * @notice Return whether the faucet checks for the presence of LifeSpan NFT
+     * @return boolean
+     */
+    function getIsTokenNFTCheck() external view returns (bool);
+
+    /**
+     * @notice Return the time how long the user has to wait before using the faucet again
+     * @return number of seconds (timestamp)
+     */
+    function getUserTimeLimit(address receiver) external view returns (uint256);
+
+    /**
+     * @notice Check whether the user can use the faucet
+     * @return boolean
+     */
+    function getCanTheAddressReceiveReward(address receiver)
+        external
+        view
+        returns (bool);
+
+    /// @notice Emitted when user get tokens from faucet
+    event TokensSent(address indexed receiver, uint256 amount);
+
+    /// @notice Emitted when were the tokens withdrawn from the faucet
+    event TokensWithdrawn(
+        address indexed banker,
+        address indexed receiver,
+        uint256 amount
+    );
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushGetLifeSpan {
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Change mint price
+     * @param _newPrice new price
+     */
+    function changeMintPrice(uint256 _newPrice) external;
+
+    /**
+     * @notice Set new fee address
+     * @param _address new fee address
+     */
+    function setFeeAddress(address _address) external;
+
+    /**
+     * @notice Set new LifeSpan contract address
+     * @param _address new LifeSpan contract address
+     */
+    function setLifeSpanAddress(address _address) external;
+
+    /**
+     * @notice Mint LifeSpan token
+     * @param _mintAddress where to enroll the LifeSpan token after minting
+     * @param _name of token User (metadata)
+     * @param _gender of token User (metadata)
+     * @param _birthdayDate in sec of token User (metadata)
+     */
+    function mint(
+        address _mintAddress,
+        string memory _name,
+        uint256 _gender,
+        uint256 _birthdayDate
+    ) external payable;
+
+    /**
+     * @notice Free mint LifeSpan token for staffers
+     * @param _mintAddress where to enroll the LifeSpan token after minting
+     * @param _name of token User (metadata)
+     * @param _gender of token User (metadata)
+     * @param _birthdayDate in sec of token User (metadata)
+     */
+    function freeMint(
+        address _mintAddress,
+        string memory _name,
+        uint256 _gender,
+        uint256 _birthdayDate
+    ) external;
+
+    /**
+     * @notice Withdraw mint fee on feeAddress
+     * @param _amount withdraw amount
+     */
+    function withdraw(uint256 _amount) external;
+
+    /// @notice Emitted when LifeSpan token has been minted
+    event TokenMinted(
+        address indexed purchaser,
+        address indexed recipient,
+        uint256 amount
+    );
+
+    /// @notice Emitted when LifeSpan token has been minted by user with STAFF role
+    event TokenFreeMinted(address indexed staffer, address indexed recipient);
+
+    /// @notice Emitted when LifeSpan token mint price has been changed
+    event MintPriceChanged(uint256 newPrice);
+
+    /// @notice Emitted when feee address has been changed
+    event FeeAddressChanged(address indexed feeAddress);
+
+    /// @notice Emitted when LifeSpan contract address has been changed
+    event LifeSpanAddressChanged(address indexed lifeSpanAddress);
+
+    /// @notice Emitted when was the fee withdrawn
+    event FeeWithdrawn(uint256 amount, address indexed feeAddress);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushGetAmbassador {
+    struct Token {
+        uint256 id;
+        bool active;
+        bool exists;
+    }
+
+    /**
+     * @notice Mint PlushAmbassador token
+     * @param token tokenId for minting
+     */
+    function mint(uint256 token) external;
+
+    /**
+     * @notice Check the possibility of minting a token for a specific address
+     * @param applicant recipient's address
+     */
+    function checkMintPossibility(address applicant)
+        external
+        view
+        returns (bool);
+
+    /**
+     * @notice Add new token
+     * @param token tokenId for minting
+     */
+    function addNewToken(uint256 token) external;
+
+    /**
+     * @notice Enable token minting
+     * @param token tokenId for minting
+     */
+    function enableTokenMinting(uint256 token) external;
+
+    /**
+     * @notice Disable token minting
+     * @param token tokenId for minting
+     */
+    function disableTokenMinting(uint256 token) external;
+
+    /// @notice Emitted when PlushAmbassador token has been minted
+    event TokenMinted(address indexed recipient, uint256 token);
+
+    /// @notice Emitted when new PlushAmbassador token has been added
+    event TokenAdded(uint256 token);
+
+    /// @notice Emitted when minting of PlushAmbassador token has been enable
+    event TokenMintingEnable(uint256 token);
+
+    /// @notice Emitted when minting of PlushAmbassador token has been disable
+    event TokenMintingDisable(uint256 token);
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushAmbassador {
+    /**
+     * @notice Set new token URI link
+     * @param newuri URI
+     */
+    function setURI(string memory newuri) external;
+
+    /**
+     * @notice Mint Ambassador NFT
+     * @param account recipient wallet
+     * @param id token Id
+     * @param amount token mint amount
+     * @param data token data
+     */
+    function mint(
+        address account,
+        uint256 id,
+        uint256 amount,
+        bytes memory data
+    ) external;
+
+    /**
+     * @notice Mint a batch of Ambassador NFT
+     * @param to recipient wallet
+     * @param ids token Ids
+     * @param amounts token mint amount
+     * @param data token data
+     */
+    function mintBatch(
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) external;
+
+    /**
+     * @notice Set new contract URI
+     * @param _contractURI new contract URI
+     */
+    function setContractURI(string memory _contractURI) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (governance/extensions/GovernorVotes.sol)
+
+pragma solidity ^0.8.0;
+
+import "../GovernorUpgradeable.sol";
+import "../utils/IVotesUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of {Governor} for voting weight extraction from an {ERC20Votes} token, or since v4.5 an {ERC721Votes} token.
+ *
+ * _Available since v4.3._
+ *
+ * @custom:storage-size 51
+ */
+abstract contract GovernorVotesUpgradeable is Initializable, GovernorUpgradeable {
+    IVotesUpgradeable public token;
+
+    function __GovernorVotes_init(IVotesUpgradeable tokenAddress) internal onlyInitializing {
+        __GovernorVotes_init_unchained(tokenAddress);
+    }
+
+    function __GovernorVotes_init_unchained(IVotesUpgradeable tokenAddress) internal onlyInitializing {
+        token = tokenAddress;
+    }
+
+    /**
+     * Read the voting weight from the token's built in snapshot mechanism (see {Governor-_getVotes}).
+     */
+    function _getVotes(
+        address account,
+        uint256 blockNumber,
+        bytes memory /*params*/
+    ) internal view virtual override returns (uint256) {
+        return token.getPastVotes(account, blockNumber);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[50] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (governance/utils/IVotes.sol)
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Common interface for {ERC20Votes}, {ERC721Votes}, and other {Votes}-enabled contracts.
+ *
+ * _Available since v4.5._
+ */
+interface IVotesUpgradeable {
+    /**
+     * @dev Emitted when an account changes their delegate.
+     */
+    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
+
+    /**
+     * @dev Emitted when a token transfer or delegate change results in changes to a delegate's number of votes.
+     */
+    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);
+
+    /**
+     * @dev Returns the current amount of votes that `account` has.
+     */
+    function getVotes(address account) external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of votes that `account` had at the end of a past block (`blockNumber`).
+     */
+    function getPastVotes(address account, uint256 blockNumber) external view returns (uint256);
+
+    /**
+     * @dev Returns the total supply of votes available at the end of a past block (`blockNumber`).
+     *
+     * NOTE: This value is the sum of all available votes, which is not necessarily the sum of all delegated votes.
+     * Votes that have not been delegated are still part of total supply, even though they would not participate in a
+     * vote.
+     */
+    function getPastTotalSupply(uint256 blockNumber) external view returns (uint256);
+
+    /**
+     * @dev Returns the delegate that `account` has chosen.
+     */
+    function delegates(address account) external view returns (address);
+
+    /**
+     * @dev Delegates votes from the sender to `delegatee`.
+     */
+    function delegate(address delegatee) external;
+
+    /**
+     * @dev Delegates votes from signer to `delegatee`.
+     */
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.2) (governance/extensions/GovernorVotesQuorumFraction.sol)
+
+pragma solidity ^0.8.0;
+
+import "./GovernorVotesUpgradeable.sol";
+import "../../utils/CheckpointsUpgradeable.sol";
+import "../../utils/math/SafeCastUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of {Governor} for voting weight extraction from an {ERC20Votes} token and a quorum expressed as a
+ * fraction of the total supply.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorVotesQuorumFractionUpgradeable is Initializable, GovernorVotesUpgradeable {
+    using CheckpointsUpgradeable for CheckpointsUpgradeable.History;
+
+    uint256 private _quorumNumerator; // DEPRECATED
+    CheckpointsUpgradeable.History private _quorumNumeratorHistory;
+
+    event QuorumNumeratorUpdated(uint256 oldQuorumNumerator, uint256 newQuorumNumerator);
+
+    /**
+     * @dev Initialize quorum as a fraction of the token's total supply.
+     *
+     * The fraction is specified as `numerator / denominator`. By default the denominator is 100, so quorum is
+     * specified as a percent: a numerator of 10 corresponds to quorum being 10% of total supply. The denominator can be
+     * customized by overriding {quorumDenominator}.
+     */
+    function __GovernorVotesQuorumFraction_init(uint256 quorumNumeratorValue) internal onlyInitializing {
+        __GovernorVotesQuorumFraction_init_unchained(quorumNumeratorValue);
+    }
+
+    function __GovernorVotesQuorumFraction_init_unchained(uint256 quorumNumeratorValue) internal onlyInitializing {
+        _updateQuorumNumerator(quorumNumeratorValue);
+    }
+
+    /**
+     * @dev Returns the current quorum numerator. See {quorumDenominator}.
+     */
+    function quorumNumerator() public view virtual returns (uint256) {
+        return _quorumNumeratorHistory._checkpoints.length == 0 ? _quorumNumerator : _quorumNumeratorHistory.latest();
+    }
+
+    /**
+     * @dev Returns the quorum numerator at a specific block number. See {quorumDenominator}.
+     */
+    function quorumNumerator(uint256 blockNumber) public view virtual returns (uint256) {
+        // If history is empty, fallback to old storage
+        uint256 length = _quorumNumeratorHistory._checkpoints.length;
+        if (length == 0) {
+            return _quorumNumerator;
+        }
+
+        // Optimistic search, check the latest checkpoint
+        CheckpointsUpgradeable.Checkpoint memory latest = _quorumNumeratorHistory._checkpoints[length - 1];
+        if (latest._blockNumber <= blockNumber) {
+            return latest._value;
+        }
+
+        // Otherwize, do the binary search
+        return _quorumNumeratorHistory.getAtBlock(blockNumber);
+    }
+
+    /**
+     * @dev Returns the quorum denominator. Defaults to 100, but may be overridden.
+     */
+    function quorumDenominator() public view virtual returns (uint256) {
+        return 100;
+    }
+
+    /**
+     * @dev Returns the quorum for a block number, in terms of number of votes: `supply * numerator / denominator`.
+     */
+    function quorum(uint256 blockNumber) public view virtual override returns (uint256) {
+        return (token.getPastTotalSupply(blockNumber) * quorumNumerator(blockNumber)) / quorumDenominator();
+    }
+
+    /**
+     * @dev Changes the quorum numerator.
+     *
+     * Emits a {QuorumNumeratorUpdated} event.
+     *
+     * Requirements:
+     *
+     * - Must be called through a governance proposal.
+     * - New numerator must be smaller or equal to the denominator.
+     */
+    function updateQuorumNumerator(uint256 newQuorumNumerator) external virtual onlyGovernance {
+        _updateQuorumNumerator(newQuorumNumerator);
+    }
+
+    /**
+     * @dev Changes the quorum numerator.
+     *
+     * Emits a {QuorumNumeratorUpdated} event.
+     *
+     * Requirements:
+     *
+     * - New numerator must be smaller or equal to the denominator.
+     */
+    function _updateQuorumNumerator(uint256 newQuorumNumerator) internal virtual {
+        require(
+            newQuorumNumerator <= quorumDenominator(),
+            "GovernorVotesQuorumFraction: quorumNumerator over quorumDenominator"
+        );
+
+        uint256 oldQuorumNumerator = quorumNumerator();
+
+        // Make sure we keep track of the original numerator in contracts upgraded from a version without checkpoints.
+        if (oldQuorumNumerator != 0 && _quorumNumeratorHistory._checkpoints.length == 0) {
+            _quorumNumeratorHistory._checkpoints.push(
+                CheckpointsUpgradeable.Checkpoint({_blockNumber: 0, _value: SafeCastUpgradeable.toUint224(oldQuorumNumerator)})
+            );
+        }
+
+        // Set new quorum for future proposals
+        _quorumNumeratorHistory.push(newQuorumNumerator);
+
+        emit QuorumNumeratorUpdated(oldQuorumNumerator, newQuorumNumerator);
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[48] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.5.0) (utils/Checkpoints.sol)
+pragma solidity ^0.8.0;
+
+import "./math/MathUpgradeable.sol";
+import "./math/SafeCastUpgradeable.sol";
+
+/**
+ * @dev This library defines the `History` struct, for checkpointing values as they change at different points in
+ * time, and later looking up past values by block number. See {Votes} as an example.
+ *
+ * To create a history of checkpoints define a variable type `Checkpoints.History` in your contract, and store a new
+ * checkpoint for the current transaction block using the {push} function.
+ *
+ * _Available since v4.5._
+ */
+library CheckpointsUpgradeable {
+    struct Checkpoint {
+        uint32 _blockNumber;
+        uint224 _value;
+    }
+
+    struct History {
+        Checkpoint[] _checkpoints;
+    }
+
+    /**
+     * @dev Returns the value in the latest checkpoint, or zero if there are no checkpoints.
+     */
+    function latest(History storage self) internal view returns (uint256) {
+        uint256 pos = self._checkpoints.length;
+        return pos == 0 ? 0 : self._checkpoints[pos - 1]._value;
+    }
+
+    /**
+     * @dev Returns the value at a given block number. If a checkpoint is not available at that block, the closest one
+     * before it is returned, or zero otherwise.
+     */
+    function getAtBlock(History storage self, uint256 blockNumber) internal view returns (uint256) {
+        require(blockNumber < block.number, "Checkpoints: block not yet mined");
+
+        uint256 high = self._checkpoints.length;
+        uint256 low = 0;
+        while (low < high) {
+            uint256 mid = MathUpgradeable.average(low, high);
+            if (self._checkpoints[mid]._blockNumber > blockNumber) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return high == 0 ? 0 : self._checkpoints[high - 1]._value;
+    }
+
+    /**
+     * @dev Pushes a value onto a History so that it is stored as the checkpoint for the current block.
+     *
+     * Returns previous value and new value.
+     */
+    function push(History storage self, uint256 value) internal returns (uint256, uint256) {
+        uint256 pos = self._checkpoints.length;
+        uint256 old = latest(self);
+        if (pos > 0 && self._checkpoints[pos - 1]._blockNumber == block.number) {
+            self._checkpoints[pos - 1]._value = SafeCastUpgradeable.toUint224(value);
+        } else {
+            self._checkpoints.push(
+                Checkpoint({_blockNumber: SafeCastUpgradeable.toUint32(block.number), _value: SafeCastUpgradeable.toUint224(value)})
+            );
+        }
+        return (old, value);
+    }
+
+    /**
+     * @dev Pushes a value onto a History, by updating the latest value using binary operation `op`. The new value will
+     * be set to `op(latest, delta)`.
+     *
+     * Returns previous value and new value.
+     */
+    function push(
+        History storage self,
+        function(uint256, uint256) view returns (uint256) op,
+        uint256 delta
+    ) internal returns (uint256, uint256) {
+        return push(self, op(latest(self), delta));
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (utils/math/Math.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Standard math utilities missing in the Solidity language.
+ */
+library MathUpgradeable {
+    enum Rounding {
+        Down, // Toward negative infinity
+        Up, // Toward infinity
+        Zero // Toward zero
+    }
+
+    /**
+     * @dev Returns the largest of two numbers.
+     */
+    function max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a >= b ? a : b;
+    }
+
+    /**
+     * @dev Returns the smallest of two numbers.
+     */
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    /**
+     * @dev Returns the average of two numbers. The result is rounded towards
+     * zero.
+     */
+    function average(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b) / 2 can overflow.
+        return (a & b) + (a ^ b) / 2;
+    }
+
+    /**
+     * @dev Returns the ceiling of the division of two numbers.
+     *
+     * This differs from standard division with `/` in that it rounds up instead
+     * of rounding down.
+     */
+    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        // (a + b - 1) / b can overflow on addition, so we distribute.
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /**
+     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)
+     * with further edits by Uniswap Labs also under MIT license.
+     */
+    function mulDiv(
+        uint256 x,
+        uint256 y,
+        uint256 denominator
+    ) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256
+            // variables such that product = prod1 * 2^256 + prod0.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division.
+            if (prod1 == 0) {
+                return prod0 / denominator;
+            }
+
+            // Make sure the result is less than 2^256. Also prevents denominator == 0.
+            require(denominator > prod1);
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0].
+            uint256 remainder;
+            assembly {
+                // Compute remainder using mulmod.
+                remainder := mulmod(x, y, denominator)
+
+                // Subtract 256 bit number from 512 bit number.
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.
+            // See https://cs.stackexchange.com/q/138556/92363.
+
+            // Does not overflow because the denominator cannot be zero at this stage in the function.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                // Divide denominator by twos.
+                denominator := div(denominator, twos)
+
+                // Divide [prod1 prod0] by twos.
+                prod0 := div(prod0, twos)
+
+                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            // Shift in bits from prod1 into prod0.
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such
+            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for
+            // four bits. That is, denominator * inv = 1 mod 2^4.
+            uint256 inverse = (3 * denominator) ^ 2;
+
+            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works
+            // in modular arithmetic, doubling the correct bits in each step.
+            inverse *= 2 - denominator * inverse; // inverse mod 2^8
+            inverse *= 2 - denominator * inverse; // inverse mod 2^16
+            inverse *= 2 - denominator * inverse; // inverse mod 2^32
+            inverse *= 2 - denominator * inverse; // inverse mod 2^64
+            inverse *= 2 - denominator * inverse; // inverse mod 2^128
+            inverse *= 2 - denominator * inverse; // inverse mod 2^256
+
+            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.
+            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is
+            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1
+            // is no longer required.
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    /**
+     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.
+     */
+    function mulDiv(
+        uint256 x,
+        uint256 y,
+        uint256 denominator,
+        Rounding rounding
+    ) internal pure returns (uint256) {
+        uint256 result = mulDiv(x, y, denominator);
+        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {
+            result += 1;
+        }
+        return result;
+    }
+
+    /**
+     * @dev Returns the square root of a number. It the number is not a perfect square, the value is rounded down.
+     *
+     * Inspired by Henry S. Warren, Jr.'s "Hacker's Delight" (Chapter 11).
+     */
+    function sqrt(uint256 a) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+
+        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.
+        // We know that the "msb" (most significant bit) of our target number `a` is a power of 2 such that we have
+        // `msb(a) <= a < 2*msb(a)`.
+        // We also know that `k`, the position of the most significant bit, is such that `msb(a) = 2**k`.
+        // This gives `2**k < a <= 2**(k+1)` → `2**(k/2) <= sqrt(a) < 2 ** (k/2+1)`.
+        // Using an algorithm similar to the msb conmputation, we are able to compute `result = 2**(k/2)` which is a
+        // good first aproximation of `sqrt(a)` with at least 1 correct bit.
+        uint256 result = 1;
+        uint256 x = a;
+        if (x >> 128 > 0) {
+            x >>= 128;
+            result <<= 64;
+        }
+        if (x >> 64 > 0) {
+            x >>= 64;
+            result <<= 32;
+        }
+        if (x >> 32 > 0) {
+            x >>= 32;
+            result <<= 16;
+        }
+        if (x >> 16 > 0) {
+            x >>= 16;
+            result <<= 8;
+        }
+        if (x >> 8 > 0) {
+            x >>= 8;
+            result <<= 4;
+        }
+        if (x >> 4 > 0) {
+            x >>= 4;
+            result <<= 2;
+        }
+        if (x >> 2 > 0) {
+            result <<= 1;
+        }
+
+        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,
+        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at
+        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision
+        // into the expected uint128 result.
+        unchecked {
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            result = (result + a / result) >> 1;
+            return min(result, a / result);
+        }
+    }
+
+    /**
+     * @notice Calculates sqrt(a), following the selected rounding direction.
+     */
+    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {
+        uint256 result = sqrt(a);
+        if (rounding == Rounding.Up && result * result < a) {
+            result += 1;
+        }
+        return result;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (governance/extensions/GovernorCountingSimple.sol)
+
+pragma solidity ^0.8.0;
+
+import "../GovernorUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of {Governor} for simple, 3 options, vote counting.
+ *
+ * _Available since v4.3._
+ */
+abstract contract GovernorCountingSimpleUpgradeable is Initializable, GovernorUpgradeable {
+    function __GovernorCountingSimple_init() internal onlyInitializing {
+    }
+
+    function __GovernorCountingSimple_init_unchained() internal onlyInitializing {
+    }
+    /**
+     * @dev Supported vote types. Matches Governor Bravo ordering.
+     */
+    enum VoteType {
+        Against,
+        For,
+        Abstain
+    }
+
+    struct ProposalVote {
+        uint256 againstVotes;
+        uint256 forVotes;
+        uint256 abstainVotes;
+        mapping(address => bool) hasVoted;
+    }
+
+    mapping(uint256 => ProposalVote) private _proposalVotes;
+
+    /**
+     * @dev See {IGovernor-COUNTING_MODE}.
+     */
+    // solhint-disable-next-line func-name-mixedcase
+    function COUNTING_MODE() public pure virtual override returns (string memory) {
+        return "support=bravo&quorum=for,abstain";
+    }
+
+    /**
+     * @dev See {IGovernor-hasVoted}.
+     */
+    function hasVoted(uint256 proposalId, address account) public view virtual override returns (bool) {
+        return _proposalVotes[proposalId].hasVoted[account];
+    }
+
+    /**
+     * @dev Accessor to the internal vote counts.
+     */
+    function proposalVotes(uint256 proposalId)
+        public
+        view
+        virtual
+        returns (
+            uint256 againstVotes,
+            uint256 forVotes,
+            uint256 abstainVotes
+        )
+    {
+        ProposalVote storage proposalvote = _proposalVotes[proposalId];
+        return (proposalvote.againstVotes, proposalvote.forVotes, proposalvote.abstainVotes);
+    }
+
+    /**
+     * @dev See {Governor-_quorumReached}.
+     */
+    function _quorumReached(uint256 proposalId) internal view virtual override returns (bool) {
+        ProposalVote storage proposalvote = _proposalVotes[proposalId];
+
+        return quorum(proposalSnapshot(proposalId)) <= proposalvote.forVotes + proposalvote.abstainVotes;
+    }
+
+    /**
+     * @dev See {Governor-_voteSucceeded}. In this module, the forVotes must be strictly over the againstVotes.
+     */
+    function _voteSucceeded(uint256 proposalId) internal view virtual override returns (bool) {
+        ProposalVote storage proposalvote = _proposalVotes[proposalId];
+
+        return proposalvote.forVotes > proposalvote.againstVotes;
+    }
+
+    /**
+     * @dev See {Governor-_countVote}. In this module, the support follows the `VoteType` enum (from Governor Bravo).
+     */
+    function _countVote(
+        uint256 proposalId,
+        address account,
+        uint8 support,
+        uint256 weight,
+        bytes memory // params
+    ) internal virtual override {
+        ProposalVote storage proposalvote = _proposalVotes[proposalId];
+
+        require(!proposalvote.hasVoted[account], "GovernorVotingSimple: vote already cast");
+        proposalvote.hasVoted[account] = true;
+
+        if (support == uint8(VoteType.Against)) {
+            proposalvote.againstVotes += weight;
+        } else if (support == uint8(VoteType.For)) {
+            proposalvote.forVotes += weight;
+        } else if (support == uint8(VoteType.Abstain)) {
+            proposalvote.abstainVotes += weight;
+        } else {
+            revert("GovernorVotingSimple: invalid value for enum VoteType");
+        }
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[49] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (governance/extensions/GovernorSettings.sol)
+
+pragma solidity ^0.8.0;
+
+import "../GovernorUpgradeable.sol";
+import "../../proxy/utils/Initializable.sol";
+
+/**
+ * @dev Extension of {Governor} for settings updatable through governance.
+ *
+ * _Available since v4.4._
+ */
+abstract contract GovernorSettingsUpgradeable is Initializable, GovernorUpgradeable {
+    uint256 private _votingDelay;
+    uint256 private _votingPeriod;
+    uint256 private _proposalThreshold;
+
+    event VotingDelaySet(uint256 oldVotingDelay, uint256 newVotingDelay);
+    event VotingPeriodSet(uint256 oldVotingPeriod, uint256 newVotingPeriod);
+    event ProposalThresholdSet(uint256 oldProposalThreshold, uint256 newProposalThreshold);
+
+    /**
+     * @dev Initialize the governance parameters.
+     */
+    function __GovernorSettings_init(
+        uint256 initialVotingDelay,
+        uint256 initialVotingPeriod,
+        uint256 initialProposalThreshold
+    ) internal onlyInitializing {
+        __GovernorSettings_init_unchained(initialVotingDelay, initialVotingPeriod, initialProposalThreshold);
+    }
+
+    function __GovernorSettings_init_unchained(
+        uint256 initialVotingDelay,
+        uint256 initialVotingPeriod,
+        uint256 initialProposalThreshold
+    ) internal onlyInitializing {
+        _setVotingDelay(initialVotingDelay);
+        _setVotingPeriod(initialVotingPeriod);
+        _setProposalThreshold(initialProposalThreshold);
+    }
+
+    /**
+     * @dev See {IGovernor-votingDelay}.
+     */
+    function votingDelay() public view virtual override returns (uint256) {
+        return _votingDelay;
+    }
+
+    /**
+     * @dev See {IGovernor-votingPeriod}.
+     */
+    function votingPeriod() public view virtual override returns (uint256) {
+        return _votingPeriod;
+    }
+
+    /**
+     * @dev See {Governor-proposalThreshold}.
+     */
+    function proposalThreshold() public view virtual override returns (uint256) {
+        return _proposalThreshold;
+    }
+
+    /**
+     * @dev Update the voting delay. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {VotingDelaySet} event.
+     */
+    function setVotingDelay(uint256 newVotingDelay) public virtual onlyGovernance {
+        _setVotingDelay(newVotingDelay);
+    }
+
+    /**
+     * @dev Update the voting period. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {VotingPeriodSet} event.
+     */
+    function setVotingPeriod(uint256 newVotingPeriod) public virtual onlyGovernance {
+        _setVotingPeriod(newVotingPeriod);
+    }
+
+    /**
+     * @dev Update the proposal threshold. This operation can only be performed through a governance proposal.
+     *
+     * Emits a {ProposalThresholdSet} event.
+     */
+    function setProposalThreshold(uint256 newProposalThreshold) public virtual onlyGovernance {
+        _setProposalThreshold(newProposalThreshold);
+    }
+
+    /**
+     * @dev Internal setter for the voting delay.
+     *
+     * Emits a {VotingDelaySet} event.
+     */
+    function _setVotingDelay(uint256 newVotingDelay) internal virtual {
+        emit VotingDelaySet(_votingDelay, newVotingDelay);
+        _votingDelay = newVotingDelay;
+    }
+
+    /**
+     * @dev Internal setter for the voting period.
+     *
+     * Emits a {VotingPeriodSet} event.
+     */
+    function _setVotingPeriod(uint256 newVotingPeriod) internal virtual {
+        // voting period must be at least one block long
+        require(newVotingPeriod > 0, "GovernorSettings: voting period too low");
+        emit VotingPeriodSet(_votingPeriod, newVotingPeriod);
+        _votingPeriod = newVotingPeriod;
+    }
+
+    /**
+     * @dev Internal setter for the proposal threshold.
+     *
+     * Emits a {ProposalThresholdSet} event.
+     */
+    function _setProposalThreshold(uint256 newProposalThreshold) internal virtual {
+        emit ProposalThresholdSet(_proposalThreshold, newProposalThreshold);
+        _proposalThreshold = newProposalThreshold;
+    }
+
+    /**
+     * @dev This empty reserved space is put in place to allow future versions to add new
+     * variables without shifting down storage in the inheritance chain.
+     * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps
+     */
+    uint256[47] private __gap;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.4;
+
+interface IPlushController {
+    /// @notice Pause contract
+    function pause() external;
+
+    /// @notice Unpause contract
+    function unpause() external;
+
+    /**
+     * @notice Adding a new application address
+     * @param appAddress contract address
+     */
+    function addNewAppAddress(address appAddress) external;
+
+    /**
+     * @notice Removing an application from the controller's application database
+     * @param appAddress contract address
+     */
+    function deleteAppAddress(address appAddress) external;
+
+    /**
+     * @notice Getting the balance of the controller (related to all its applications)
+     * @return ERC-20 token balance in wei
+     */
+    function getBalance() external view returns (uint256);
+
+    /**
+     * @notice Withdrawal of tokens from the controller's balance
+     * @param amount of tokens to be withdrawn in wei
+     */
+    function withdraw(uint256 amount) external;
+
+    /**
+     * @notice Get a list of all current application addresses
+     * @return list of all application addresses
+     */
+    function getAppAddresses() external view returns (address[] memory);
+
+    /**
+     * @notice Debiting user tokens by the controller
+     * @param account user account
+     * @param amount amount of tokens debited
+     */
+    function decreaseAccountBalance(address account, uint256 amount) external;
+
+    /**
+     * @notice Transfer tokens to the user account from the controller's balance
+     * @param account receiver address
+     * @param amount transfer amount
+     */
+    function increaseAccountBalance(address account, uint256 amount) external;
+
+    /// @notice Emitted when was the new app added
+    event AppAdded(address indexed appAddress, address indexed operator);
+
+    /// @notice Emitted when the app was deleted
+    event AppDeleted(address indexed appAddress, address indexed operator);
+
+    /// @notice Emitted when were the funds withdrawn from the controller account
+    event Withdrawn(address indexed recipient, uint256 amount);
+
+    /// @notice Emitted when were the funds debited from the user's account
+    event BalanceDecreased(
+        address indexed app,
+        address indexed account,
+        uint256 amount
+    );
+
+    /// @notice Emitted when were the funds transferred to the user's account
+    event BalanceIncreased(
+        address indexed app,
+        address indexed account,
+        uint256 amount
+    );
+}
