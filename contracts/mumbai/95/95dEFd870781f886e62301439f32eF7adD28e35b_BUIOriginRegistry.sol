@@ -1,0 +1,202 @@
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract BUIOriginRegistry is Ownable {
+    mapping(bytes32 => address) private _ownerOfOrigin;
+    mapping(address => bytes32[]) private _originsForAddress;
+    mapping(bytes32 => uint256) private _balanceForOrigin;
+    mapping(bytes32 => string) private _domainForOrigin;
+
+    uint256 private _minBalance = 0.1 ether;
+
+    event OriginRegistered(address owner, bytes32 origin);
+    event OriginUnregistered(address owner, bytes32 origin);
+
+    constructor(uint256 minBalance) {
+        _minBalance = minBalance;
+    }
+
+    function withdraw() external onlyOwner() {
+        uint balance = address(this).balance;
+        payable(owner()).transfer(balance);
+    }
+
+    function register(string memory fqdn) external payable {
+        bytes32 origin = keccak256(abi.encodePacked(fqdn));
+
+        require(msg.value >= _minBalance, "Must meet the minimum balance requirement");
+        require(_ownerOfOrigin[origin] == address(0), "This origin is already registered");
+
+        bytes32[] storage origins = _originsForAddress[msg.sender];
+        for (uint i = 0; i < origins.length; i++) {
+            if (origin == origins[i]) {
+                revert("Origin already exists");
+            }
+        }
+
+        _ownerOfOrigin[origin] = msg.sender;
+        _originsForAddress[msg.sender].push(origin);
+        _balanceForOrigin[origin] += msg.value;
+        _domainForOrigin[origin] = fqdn;
+
+        emit OriginRegistered(msg.sender, origin);
+    }
+
+    function unregister(bytes32 origin) external {
+        require(_ownerOfOrigin[origin] == msg.sender, "Not authorized");
+
+        bytes32[] storage origins = _originsForAddress[msg.sender];
+
+        for (uint i = 0; i < origins.length; i++) {
+            if (origin == origins[i]) {
+                // Overwrite and shift remaining origins
+                for (uint j = i; j < origins.length-1; j++) {
+                    origins[j] = origins[j+1];
+                }
+                origins.pop();
+
+                _originsForAddress[msg.sender] = origins;
+                _domainForOrigin[origin] = "";
+
+                uint256 balance = _balanceForOrigin[origin];
+                _balanceForOrigin[origin] = 0;
+
+                address payable owner = payable(_ownerOfOrigin[origin]);
+                _ownerOfOrigin[origin] = address(0);
+
+                if (balance > 0) {
+                    owner.transfer(balance);
+                }
+
+                emit OriginUnregistered(msg.sender, origin);
+
+                break;
+            }
+        }
+    }
+
+    function verifyOwner(bytes32 origin, address owner) public view returns (bool) {
+        return _ownerOfOrigin[origin] == owner;
+    }
+
+    function originsForOwner(address owner) public view returns (string[] memory) {
+        string[] memory origins = new string[](_originsForAddress[owner].length);
+
+        for (uint i = 0; i < _originsForAddress[owner].length; i++) {
+            bytes32 origin = _originsForAddress[owner][i];
+            origins[i] = _domainForOrigin[origin];
+        }
+
+        return origins;
+    }
+
+    // TODO: node payout methods
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
