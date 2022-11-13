@@ -1,0 +1,27 @@
+/**
+ *Submitted for verification at polygonscan.com on 2022-11-12
+*/
+
+/**
+ *Submitted for verification at polygonscan.com on 2022-11-11
+*/
+
+contract UniRouterMock {
+    function getAmountsIn(uint amountIn, address[] memory path)
+        public
+        pure
+        returns (uint[] memory amounts){
+            amounts = new uint[](2);
+            amounts[0] = 1;
+            amounts[1] = 1;
+    }
+
+    function getAmountsOut(uint amountIn, address[] memory path)
+        public
+        pure
+        returns (uint[] memory amounts){
+            amounts = new uint[](2);
+            amounts[0] = 1;
+            amounts[1] = 1;
+    }
+}
