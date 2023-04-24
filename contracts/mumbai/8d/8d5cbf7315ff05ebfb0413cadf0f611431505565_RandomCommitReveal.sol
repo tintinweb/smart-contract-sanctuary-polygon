@@ -1,0 +1,44 @@
+/**
+ *Submitted for verification at polygonscan.com on 2023-04-24
+*/
+
+//SPDX-License-Identifier: MIT
+
+// https://mumbai.polygonscan.com/address/0x6ae671c643520c7c200c7afb96adbd1e672d4c55
+
+pragma solidity ^0.8.0;
+
+contract RandomCommitReveal {
+
+    // global for testing
+    uint256 public randomNumber;
+
+    struct Commitment {
+        uint256 entropy;
+        uint256 blockNumber;
+    }
+
+    mapping (address => Commitment) commitments;
+
+    // 1. Commit a number on chain. Use as entropy
+    function commit(uint256 _entropy) public {
+        commitments[msg.sender].entropy = _entropy;
+        commitments[msg.sender].blockNumber = block.number;
+    }
+
+    // 2. After a few blocks, reveal random number
+    function reveal() public {
+        require(commitments[msg.sender].blockNumber != 0, "Must commit");
+        require(commitments[msg.sender].blockNumber < block.number, "Reveal too soon");
+        uint256 entropy = commitments[msg.sender].entropy;
+        // reset commitment
+        commitments[msg.sender].blockNumber = 0;
+        commitments[msg.sender].entropy = 0;
+        // set random number @TODO logic with this random number
+        randomNumber = uint256(keccak256(abi.encodePacked(
+            block.timestamp,
+            entropy
+        ))); 
+    }
+
+}
