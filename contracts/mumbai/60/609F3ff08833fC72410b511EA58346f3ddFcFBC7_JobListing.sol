@@ -1,0 +1,1053 @@
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC20/ERC20.sol)
+
+pragma solidity ^0.8.0;
+
+import "./IERC20.sol";
+import "./extensions/IERC20Metadata.sol";
+import "../../utils/Context.sol";
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.openzeppelin.com/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * The default value of {decimals} is 18. To select a different value for
+     * {decimals} you should overload it.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the value {ERC20} uses, unless this function is
+     * overridden;
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, allowance(owner, spender) + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = allowance(owner, spender);
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `from` to `to`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+            // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
+            // decrementing then incrementing.
+            _balances[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        unchecked {
+            // Overflow not possible: balance + amount is at most totalSupply + amount, which is checked above.
+            _balances[account] += amount;
+        }
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+            // Overflow not possible: amount <= accountBalance <= totalSupply.
+            _totalSupply -= amount;
+        }
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)
+
+pragma solidity ^0.8.0;
+
+import "../IERC20.sol";
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "./ReputationSystem.sol";
+import "./TokenManagement.sol";
+import "./UserRegistry.sol";
+
+contract JobListing {
+    // Add instances of the contracts
+    ReputationSystem reputationSystem;
+    TokenManagement tokenManagement;
+    UserRegistry userRegistry;
+
+    // Struct to store data about a job listing
+    struct Job {
+        uint id; // Unique identifier for the job listing
+        address employer; // Address of the employer who posted the job
+        string title; // Job title
+        string description; // Job description
+        string requiredSkills; // Required skills for the job
+        uint experience; // Required experience level
+        uint compensation; // Compensation offered for the job
+        bool isActive; // Status of the job: true if active, false otherwise
+    }
+
+    // Counter to keep track of the total number of job listings
+    uint private jobCounter;
+
+    // Mapping to store job listings by their unique identifier
+    mapping(uint => Job) private jobs;
+
+    // Event emitted when a new job listing is posted
+    event JobPosted(
+        uint indexed jobId,
+        address indexed employer,
+        string title,
+        string description,
+        string requiredSkills,
+        uint experience,
+        uint compensation
+    );
+
+    // Event emitted when a job listing is updated
+    event JobUpdated(
+        uint indexed jobId,
+        string title,
+        string description,
+        string requiredSkills,
+        uint experience,
+        uint compensation
+    );
+
+    // Event emitted when a job listing is removed
+    event JobRemoved(uint indexed jobId);
+
+    // Add constructor to receive the addresses of the required contracts
+    constructor(
+        address _reputationSystem,
+        address _tokenManagement,
+        address _userRegistry
+    ) {
+        reputationSystem = ReputationSystem(_reputationSystem);
+        tokenManagement = TokenManagement(_tokenManagement);
+        userRegistry = UserRegistry(_userRegistry);
+    }
+
+    // Function to post a new job listing
+    function postJob(
+        string memory _title,
+        string memory _description,
+        string memory _requiredSkills,
+        uint _experience,
+        uint _compensation
+    ) public {
+        jobCounter++;
+
+        // Create a new Job struct and store it in the jobs mapping
+        Job memory newJob = Job(
+            jobCounter,
+            msg.sender,
+            _title,
+            _description,
+            _requiredSkills,
+            _experience,
+            _compensation,
+            true
+        );
+        jobs[jobCounter] = newJob;
+
+        // Emit the JobPosted event
+        emit JobPosted(
+            jobCounter,
+            msg.sender,
+            _title,
+            _description,
+            _requiredSkills,
+            _experience,
+            _compensation
+        );
+    }
+
+    // Function to update an existing job listing
+    function updateJob(
+        uint _jobId,
+        string memory _title,
+        string memory _description,
+        string memory _requiredSkills,
+        uint _experience,
+        uint _compensation
+    ) public {
+        Job storage job = jobs[_jobId];
+
+        // Ensure that only the employer can update the job listing
+        require(
+            job.employer == msg.sender,
+            "Only the job employer can update the job"
+        );
+        // Ensure that the job listing is still active
+        require(job.isActive, "Job is not active");
+
+        // Update the job details
+        job.title = _title;
+        job.description = _description;
+        job.requiredSkills = _requiredSkills;
+        job.experience = _experience;
+        job.compensation = _compensation;
+
+        // Emit the JobUpdated event
+        emit JobUpdated(
+            _jobId,
+            _title,
+            _description,
+            _requiredSkills,
+            _experience,
+            _compensation
+        );
+    }
+
+    // Function to remove a job listing
+    function removeJob(uint _jobId) public {
+        Job storage job = jobs[_jobId];
+
+        // Ensure that only the employer can remove the job listing
+        require(
+            job.employer == msg.sender,
+            "Only the job employer can remove the job"
+        );
+        // Ensure that the job listing is still active
+        require(job.isActive, "Job is not active");
+        // Set the job listing status to inactive
+        job.isActive = false;
+
+        // Emit the JobRemoved event
+        emit JobRemoved(_jobId);
+    }
+
+    // Function to retrieve a job listing by its ID
+    function getJob(uint _jobId) public view returns (Job memory) {
+        return jobs[_jobId];
+    }
+
+    // Function to retrieve all active job listings
+    function getAllJobs() public view returns (Job[] memory) {
+        // Count the number of active jobs
+        uint activeJobsCount = 0;
+        for (uint i = 1; i <= jobCounter; i++) {
+            if (jobs[i].isActive) {
+                activeJobsCount++;
+            }
+        }
+
+        // Create an array to store the active Job structs
+        Job[] memory allJobs = new Job[](activeJobsCount);
+
+        // Iterate through the jobs mapping and add active jobs to the array
+        uint index = 0;
+        for (uint i = 1; i <= jobCounter; i++) {
+            if (jobs[i].isActive) {
+                allJobs[index] = jobs[i];
+                index++;
+            }
+        }
+
+        // Return the array of active Job structs
+        return allJobs;
+    }
+
+    // Complete job function
+    function completeJob(
+        uint jobId,
+        uint reviewRating,
+        string memory reviewComment
+    ) public {
+        // Fetch job and user information
+        Job memory job = getJob(jobId);
+        UserRegistry.User memory jobSeeker = userRegistry.getUserById(job.id);
+        UserRegistry.User memory employer = userRegistry.getUserByAddress(
+            job.employer
+        );
+
+        require(job.isActive, "Job is not active");
+        require(
+            employer.userType == UserRegistry.UserType.Employer,
+            "Only an employer can complete a job"
+        );
+        require(
+            jobSeeker.userType == UserRegistry.UserType.JobSeeker,
+            "Job must be assigned to a job seeker"
+        );
+
+        // Transfer tokens from employer to job seeker
+        tokenManagement.transferFrom(
+            employer.wallet,
+            jobSeeker.wallet,
+            job.compensation
+        );
+
+        // Update reputation of job seeker
+        reputationSystem.submitReview(
+            jobSeeker.id,
+            ReputationSystem.ReviewType.JobSeeker,
+            reviewRating,
+            reviewComment
+        );
+
+        // Set job as inactive
+        job.isActive = false;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "./UserRegistry.sol";
+
+contract ReputationSystem {
+    // Add an instance of the UserRegistry contract
+    UserRegistry userRegistry;
+
+    // Enum to define the type of review: Employer or JobSeeker
+    enum ReviewType {
+        Employer,
+        JobSeeker
+    }
+
+    // Struct to store review data
+    struct Review {
+        uint id;
+        uint targetUserId;
+        ReviewType reviewType;
+        address reviewer;
+        uint rating;
+        string comment;
+        uint256 timestamp;
+    }
+
+    // Counter to keep track of the number of reviews
+    uint private reviewCounter;
+    // Mapping to store reviews by their ID
+    mapping(uint => Review) private reviews;
+    // Mapping to store user reviews by their target user ID
+    mapping(uint => uint[]) private userReviews;
+
+    // Event emitted when a new review is submitted
+    event ReviewSubmitted(
+        uint indexed reviewId,
+        uint indexed targetUserId,
+        ReviewType reviewType,
+        address indexed reviewer,
+        uint rating,
+        string comment,
+        uint256 timestamp
+    );
+
+    // Add constructor to receive the address of the UserRegistry contract
+    constructor(address _userRegistry) {
+        userRegistry = UserRegistry(_userRegistry);
+    }
+
+    // Function to submit a new review
+    function submitReview(
+        uint _targetUserId,
+        ReviewType _reviewType,
+        uint _rating,
+        string memory _comment
+    ) public {
+        // Check if the target user is registered
+        require(
+            userRegistry.isUserRegistered(
+                userRegistry.getUserById(_targetUserId).wallet
+            ),
+            "User not registered"
+        );
+
+        // Ensure the rating is between 1 and 5
+        require(
+            _rating >= 1 && _rating <= 5,
+            "Rating should be between 1 and 5"
+        );
+
+        // Increment the review counter
+        reviewCounter++;
+
+        // Create a new review with the given parameters
+        Review memory newReview = Review(
+            reviewCounter,
+            _targetUserId,
+            _reviewType,
+            msg.sender,
+            _rating,
+            _comment,
+            block.timestamp
+        );
+        // Store the review in the mapping
+        reviews[reviewCounter] = newReview;
+        // Add the review ID to the user's list of reviews
+        userReviews[_targetUserId].push(reviewCounter);
+
+        // Emit the ReviewSubmitted event
+        emit ReviewSubmitted(
+            reviewCounter,
+            _targetUserId,
+            _reviewType,
+            msg.sender,
+            _rating,
+            _comment,
+            block.timestamp
+        );
+    }
+
+    // Function to get a review by its ID
+    function getReview(uint _reviewId) public view returns (Review memory) {
+        return reviews[_reviewId];
+    }
+
+    // Function to get all reviews for a specific user
+    function getReviewsByUser(
+        uint _targetUserId
+    ) public view returns (Review[] memory) {
+        // Get the list of review IDs for the target user
+        uint[] memory userRevIds = userReviews[_targetUserId];
+        // Create an array to store the user's reviews
+        Review[] memory userRevs = new Review[](userRevIds.length);
+
+        // Iterate through the user's review IDs and store the reviews in the array
+        for (uint i = 0; i < userRevIds.length; i++) {
+            userRevs[i] = reviews[userRevIds[i]];
+        }
+
+        // Return the array of user reviews
+        return userRevs;
+    }
+
+    // Function to calculate the user's reputation based on their reviews
+    function getUserReputation(uint _targetUserId) public view returns (uint) {
+        // Get the list of review IDs for the target user
+        uint[] memory userRevIds = userReviews[_targetUserId];
+
+        // If there are no reviews, return 0
+        if (userRevIds.length == 0) {
+            return 0;
+        }
+
+        // Calculate the total rating
+        uint totalRating = 0;
+
+        // Iterate through the user's review IDs and sum the ratings
+        for (uint i = 0; i < userRevIds.length; i++) {
+            totalRating += reviews[userRevIds[i]].rating;
+        }
+
+        // Calculate the average rating by dividing the total rating by the number of reviews
+        return totalRating / userRevIds.length;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// Import the ERC20 contract from OpenZeppelin
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "./UserRegistry.sol";
+
+// Define the TokenManagement contract that inherits from the ERC20 contract
+contract TokenManagement is ERC20 {
+    // Define the owner variable which represents the address of the contract owner
+    address public owner; // Define a modifier called onlyOwner, which ensures that only the contract owner can call functions with this modifier
+    UserRegistry private userRegistry;
+
+    modifier onlyOwner() {
+        require(owner == msg.sender);
+        _;
+    }
+
+    // Define the constructor, which takes the initial token supply as an argument
+    constructor(
+        uint256 initialSupply,
+        address _userRegistry
+    ) ERC20("DecentralizedJobMarketToken", "DJMT") {
+        // Mint the initial token supply and assign it to the contract deployer
+        _mint(msg.sender, initialSupply);
+        // Set the owner variable to the address of the contract deployer
+        owner = msg.sender;
+
+        userRegistry = UserRegistry(_userRegistry);
+    }
+
+    // Define the mint function, which allows the contract owner to mint new tokens to a specified address
+    function mint(address to, uint256 amount) public onlyOwner {
+        // Call the internal _mint function to create new tokens
+        _mint(to, amount);
+    }
+
+    // Define the burn function, which allows the contract owner to burn tokens from a specified address
+    function burn(address from, uint256 amount) public onlyOwner {
+        // Call the internal _burn function to destroy tokens
+        _burn(from, amount);
+    }
+
+    // Add a function to mint tokens by user ID
+    function mintByUserId(uint _userId, uint256 amount) public onlyOwner {
+        address to = userRegistry.getUserById(_userId).wallet;
+        _mint(to, amount);
+    }
+
+    // Add a function to burn tokens by user ID
+    function burnByUserId(uint _userId, uint256 amount) public onlyOwner {
+        address from = userRegistry.getUserById(_userId).wallet;
+        _burn(from, amount);
+    }
+
+    // Add a function to transfer tokens by user IDs
+    function transferByUserIds(
+        uint _fromUserId,
+        uint _toUserId,
+        uint256 amount
+    ) public onlyOwner {
+        address from = userRegistry.getUserById(_fromUserId).wallet;
+        address to = userRegistry.getUserById(_toUserId).wallet;
+        transferFrom(from, to, amount);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+// Define a new contract named UserRegistry
+contract UserRegistry {
+    // Define an enumeration UserType to distinguish between JobSeeker and Employer users
+    enum UserType {
+        JobSeeker,
+        Employer
+    } // Define a struct named User to store user information
+    struct User {
+        uint id; // Unique identifier for the user
+        UserType userType; // Type of user - JobSeeker or Employer
+        string name; // Name of the user
+        string email; // Email address of the user
+        address wallet; // Wallet address associated with the user
+        bool isRegistered; // Flag to indicate whether the user is registered or not
+    }
+
+    // Define a private variable to keep track of the total number of users
+    uint private userCounter;
+    // Define a mapping to store user data indexed by their unique identifier
+    mapping(uint => User) private users;
+    // Define a mapping to store user data indexed by their wallet address
+    mapping(address => uint) private userLookup;
+
+    // Define an event to be emitted when a new user is registered
+    event UserRegistered(
+        uint indexed userId,
+        UserType userType,
+        string name,
+        string email,
+        address wallet
+    );
+
+    // Define a function to register a new user with the given type, name, and email
+    function registerUser(
+        UserType _userType,
+        string memory _name,
+        string memory _email
+    ) public {
+        // Check if the user is already registered
+        require(!isUserRegistered(msg.sender), "User already registered");
+
+        // Increment the user counter
+        userCounter++;
+        // Create a new User struct with the provided information
+        User memory newUser = User(
+            userCounter,
+            _userType,
+            _name,
+            _email,
+            msg.sender,
+            true
+        );
+
+        // Store the new user in the users mapping and update the userLookup mapping
+        users[userCounter] = newUser;
+        userLookup[msg.sender] = userCounter;
+
+        // Emit the UserRegistered event
+        emit UserRegistered(userCounter, _userType, _name, _email, msg.sender);
+    }
+
+    // Define a function to get user information by their unique identifier
+    function getUserById(uint _userId) public view returns (User memory) {
+        return users[_userId];
+    }
+
+    // Define a function to get user information by their wallet address
+    function getUserByAddress(
+        address _wallet
+    ) public view returns (User memory) {
+        uint userId = userLookup[_wallet];
+        return users[userId];
+    }
+
+    // Define a function to check if a user is registered by their wallet address
+    function isUserRegistered(address _wallet) public view returns (bool) {
+        uint userId = userLookup[_wallet];
+        return users[userId].isRegistered;
+    }
+}
