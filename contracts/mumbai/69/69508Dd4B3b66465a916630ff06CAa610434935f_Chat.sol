@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: UNLICENSED0
+pragma solidity ^0.8.9;
+
+
+contract Chat {
+    struct User {
+        string name;
+        string email;
+        bool exists;
+        address walletAddress;
+        bool isAdmin;
+    }
+    
+    struct Message {
+        uint256 id;
+        address sender;
+        address receiver;
+        string subject;
+        string message;
+        uint256 timestamp;
+        bool read;
+        bool shareable;
+        uint256 shares;
+        uint256 views;
+        address[] viewedBy;
+        uint256 originalMessageId;
+        string fileHash;
+    }
+    struct Share {
+        uint256 messageId;
+        uint256 timestamp;
+        address sender;
+        address receiver;
+        bool read;
+    }
+
+    Share[] public shares;
+    event MessageShared(uint256 shareId, uint256 messageId, address sender, address[] receivers);
+
+    uint256 messageCount;
+    uint256 shareCount;
+    mapping(bytes32 => string) public IDs;
+    mapping (address => User) public users;
+    address[] public userAddresses;
+    address public admin;
+
+    Message[] public messages;
+    mapping(string => address) usersByName;
+    mapping(string => address) usersByEmail;
+    
+    constructor() {
+        admin = 0x603C4Ae498fd4147B4dF6378A5f16B150336f5Ef;
+        users[0x603C4Ae498fd4147B4dF6378A5f16B150336f5Ef] = User("Admin", "[email protected]", true,0x15940575e50821CAb60c331A3ccE470a5014c2C0,true);
+        userAddresses.push(0x603C4Ae498fd4147B4dF6378A5f16B150336f5Ef);
+        usersByName["Admin"] = 0x603C4Ae498fd4147B4dF6378A5f16B150336f5Ef;
+        usersByEmail["[email protected]"] = 0x603C4Ae498fd4147B4dF6378A5f16B150336f5Ef;
+
+        users[0x7fD3E2234101c7a3A97E6839E2828Ff72112a107] = User("H'nifa", "[email protected]", true,0x7fD3E2234101c7a3A97E6839E2828Ff72112a107,false);
+        userAddresses.push(0x7fD3E2234101c7a3A97E6839E2828Ff72112a107);
+        usersByName["H'nifa"] = 0x7fD3E2234101c7a3A97E6839E2828Ff72112a107;
+        usersByEmail["[email protected]"] = 0x7fD3E2234101c7a3A97E6839E2828Ff72112a107;
+
+        users[0x3d3897db18F061A171b589CC0FAb3d7D41075EeC] = User("lynda", "[email protected]", true,0x3d3897db18F061A171b589CC0FAb3d7D41075EeC,false);
+        userAddresses.push(0x3d3897db18F061A171b589CC0FAb3d7D41075EeC);
+        usersByName["lynda"] = 0x3d3897db18F061A171b589CC0FAb3d7D41075EeC;
+        usersByEmail["[email protected]"] = 0x3d3897db18F061A171b589CC0FAb3d7D41075EeC;
+
+    }
+    
+    event LogString(uint message);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin can perform this action");
+          _;
+    }
+    //makeAdmin : to make someone an admin we change isAdmin=>true
+    function makeAdmin(address userAddress) public onlyAdmin{
+        users[userAddress].isAdmin = true;
+    }
+    
+    function createUserId(string memory email, bytes32 Id) public onlyAdmin{
+        IDs[Id] = email;
+    } 
+    // Define a new role for admins
+  mapping (address => bool) private admins;
+
+  function isAdmin(address user) public view returns (bool) {
+      return admins[user];
+  }
+
+  function addAdmin(address userAddress) public onlyAdmin {
+      admins[userAddress] = true;
+  }
+
+  function removeAdmin(address userAddress) public onlyAdmin {
+      admins[userAddress] = false;
+      users[userAddress].isAdmin = false;
+  }
+
+  //--------------------------------------------------------------------------------------   
+
+    function stringsEqual(string memory a, string memory b) private pure returns (bool) {
+    return keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+
+    //Creat user
+    function createUser(uint Id, string memory name, string memory email, address walletAddress) public {
+        require(stringsEqual(IDs[sha256(abi.encode(Id))], email), "You don't have permission to create an account !");
+        require(bytes(name).length > 0, "You have to specify your name !");
+        User memory user = User(name, email, true,walletAddress,false);
+        users[walletAddress] = user;
+        userAddresses.push(walletAddress);
+        usersByName[name] = walletAddress;
+        usersByEmail[email] = walletAddress;
+        delete IDs[sha256(abi.encode(Id))];
+       // emit UserCreated(name, walletAddress);
+    }
+    //Delete user
+   function deleteUser(address walletAddress) public onlyAdmin {
+   require(walletAddress != address(0), "User with given address does not exist.");
+    delete users[walletAddress];
+    delete usersByName[users[walletAddress].name];
+    delete usersByEmail[users[walletAddress].email];
+    for (uint i = 0; i < userAddresses.length; i++) {
+        if (userAddresses[i] == walletAddress) {
+            userAddresses[i] = userAddresses[userAddresses.length - 1];
+            userAddresses.pop();
+            break;
+        }
+    }
+    //emit UserDeleted(walletAddress);
+}
+
+    
+    
+    function checkUserExists(address user) public view returns (bool) {
+        return bytes(users[user].email).length > 0;
+    }
+    
+    //event MessageSent(address indexed sender, address indexed receiver, bytes32 encryptedMessage);
+
+    function sendMessage(address[] memory receivers, string calldata subject, string calldata message, bool isShareable, string calldata fileHash) external {
+        require(
+            checkUserExists(msg.sender) == true,
+            "You must have an account"
+        );
+        
+        for (uint i = 0; i < receivers.length; i++) {
+            require(checkUserExists(receivers[i]), "Receiver does not exist");
+            Message memory newMessage = Message(
+                messageCount,
+                msg.sender,
+                receivers[i],
+                subject,
+                message,
+                block.timestamp,
+                false,
+                isShareable,
+                0,
+                0,
+                new address[](0),
+                messageCount,
+                fileHash
+            );
+            messageCount++;
+            messages.push(newMessage);
+        }
+    }
+
+    function shareMessage(uint256 messageId, address[] calldata receivers) external {
+    require(messageId < messages.length, "Invalid message ID");
+    require(checkUserExists(msg.sender) == true, "You must have an account");
+    Message storage messageToShare = messages[messageId];
+    uint256 originalMessageid = messages[messageId].originalMessageId;
+    require(messageToShare.shareable == true, "Message is not shareable");
+
+    for (uint256 i = 0; i < receivers.length; i++) {
+        require(checkUserExists(receivers[i]), "Receiver does not exist");
+        Share memory newShare = Share(messageId, block.timestamp, msg.sender, receivers[i], messages[messageId].read);
+        shares.push(newShare);
+        messageToShare.shares++;
+        messages[originalMessageid].shares++;
+        
+        // Set the originalMessageId of the shared message to the ID of the original message
+        Message memory sharedMessage = Message(
+            messageCount,
+            msg.sender,
+            receivers[i],
+            messageToShare.subject,
+            messageToShare.message,
+            block.timestamp,
+            false,
+            true,
+            0,
+            0,
+            new address[](0),
+            messages[messageId].originalMessageId,
+            messageToShare.fileHash
+        );
+        messageCount++;
+        messages.push(sharedMessage);
+    }
+    emit MessageShared(shareCount, messageId, msg.sender, receivers);
+    shareCount++;
+}
+    function getShares(uint256 messageId) external view returns (Share[] memory) {
+        require(messageId < messages.length, "Invalid message ID");
+
+        uint256 count = 0;
+        for (uint256 i = 0; i < shares.length; i++) {
+            if (messages[messageId].originalMessageId == messageId ) {
+                count++;
+            }
+        }
+        Share[] memory messageShares = new Share[](count);
+        uint256 index = 0;
+        for (uint256 i = 0; i < shares.length; i++) {
+            if (messages[messageId].originalMessageId == messageId) {
+                messageShares[index] = shares[i];
+                index++;
+            }
+        }
+        return messageShares;
+    }
+
+    function getViewedBy(uint256 messageId) public view returns (address[] memory) {
+        return messages[messageId].viewedBy;
+    }
+      function viewMessage(uint256 messageId) public {
+        uint256 originalMessageid = messages[messageId].originalMessageId;
+        messages[messageId].views++;
+        messages[originalMessageid].views++;
+        messages[messageId].read= true;
+        messages[originalMessageid].read= true;
+        messages[messageId].viewedBy.push(msg.sender);
+        messages[originalMessageid].viewedBy.push(msg.sender);
+    }
+function contains(address[] storage arr, address value) private view returns (bool) {
+    for (uint i = 0; i < arr.length; i++) {
+        if (arr[i] == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+    function getAddress(string memory email) public view returns (address) {
+        return usersByEmail[email];
+    }
+    
+    function getName(address adresse) external view returns (string memory) {
+        require(
+            checkUserExists(adresse) == true,
+            "User with given address don't exist"
+        );
+        return users[adresse].name;
+    }
+
+    function getEmail(address adresse) external view returns (string memory) {
+        require(checkUserExists(adresse) == true,"User with given address don't exist");
+        return users[adresse].email;
+    }
+
+    
+
+    function getMessagesCount(string memory email) public view returns (uint){
+            uint count = 0;
+        for (uint i = 0; i < messages.length; i++) {
+            if (messages[i].sender == getAddress(email)) {
+                count++;
+            }
+        }
+        return count;
+   }
+
+        function MessageSent(string memory email) public view returns (Message[] memory) {
+        uint count = 0;
+        for (uint i = 0; i < messages.length; i++) {
+            if (messages[i].sender == getAddress(email)) {
+                count++;
+            }
+        }
+        Message[] memory messagesSent = new Message[](count);
+        uint index = 0;
+        for (uint i = 0; i < messages.length; i++) {
+            if (messages[i].sender == getAddress(email)) {
+                messagesSent[index] = messages[i];
+                index++;
+            }
+        }
+        return messagesSent;
+    }
+
+    function MessageReceived(
+        string memory email
+    ) public view returns (Message[] memory) {  
+        uint count = 0;
+        for (uint i = 0; i < messages.length; i++) {
+            if (messages[i].receiver == getAddress(email)) {
+                count++;
+            }
+        }
+        Message[] memory messagesRecieved = new Message[](count);
+        uint index = 0;
+        for (uint i = 0; i < messages.length; i++) {
+            if (messages[i].receiver == getAddress(email)) {
+                messagesRecieved[index] = messages[i];
+                index++;
+            }
+        }
+        return messagesRecieved;
+    }
+    
+
+
+
+function getAllUsers() public view returns (User[] memory) {
+    User[] memory allUsers = new User[](userAddresses.length);
+    for (uint i = 0; i < userAddresses.length; i++) {
+        allUsers[i] = users[userAddresses[i]];
+    }
+    return allUsers;
+}
+
+function editUser(address walletAddress, string memory name, string memory email, bool isAdmin) public onlyAdmin {
+    require(checkUserExists(walletAddress), "User with given address does not exist.");
+    User storage user = users[walletAddress];
+    user.name = name;
+    user.email = email;
+    user.isAdmin = isAdmin;
+    usersByName[name] = walletAddress;
+    usersByEmail[email] = walletAddress;
+}
+
+    // Get sent messages function
+    /*function getSentMessages() public view returns (Message[] memory) {
+        return sentMessages[msg.sender];
+    }
+    
+    // Get received messages function
+    function getReceivedMessages() public view returns (Message[] memory) {
+        return receivedMessages[msg.sender];
+    }*/
+    
+    // Decrypt and read message function
+    /*function readMessage(uint256 _index, bytes32 _key, RSA.PrivateKey memory _privateKey) public {
+        Message memory message = receivedMessages[msg.sender][_index];
+        require(message.receiver == msg.sender, "You are not the intended recipient of this message.");
+        
+        bytes memory decryptedKey = decryptMessageRSA(message.encryptedKey, _privateKey);
+        bytes32 decryptedKey32 = bytesToBytes32(decryptedKey);
+        
+        string memory decryptedMessage = decryptMessage(message.encryptedMessage, decryptedKey32);
+        
+        emit MessageReceived(message.sender, message.receiver, message.encryptedMessage);
+    }
+    
+    // Utility function to convert bytes to bytes32
+    function bytesToBytes32(bytes memory _bytes) private pure returns (bytes32 result) {
+    	require(_bytes.length >= 32, "Byte array must be at least 32 bytes long.");
+    	assembly {
+        result := mload(add(_bytes, 32))
+    	}
+   }*/
+
+}
