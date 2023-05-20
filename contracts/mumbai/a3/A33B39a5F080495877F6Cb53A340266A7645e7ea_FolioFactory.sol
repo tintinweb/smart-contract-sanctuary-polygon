@@ -1,0 +1,451 @@
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)
+
+pragma solidity ^0.8.0;
+
+import "../utils/Context.sol";
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        _checkOwner();
+        _;
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if the sender is not the owner.
+     */
+    function _checkOwner() internal view virtual {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Internal function without access restriction.
+     */
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (proxy/Clones.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for
+ * deploying minimal proxy contracts, also known as "clones".
+ *
+ * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies
+ * > a minimal bytecode implementation that delegates all calls to a known, fixed address.
+ *
+ * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`
+ * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the
+ * deterministic method.
+ *
+ * _Available since v3.4._
+ */
+library Clones {
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create opcode, which should never revert.
+     */
+    function clone(address implementation) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create(0, 0x09, 0x37)
+        }
+        require(instance != address(0), "ERC1167: create failed");
+    }
+
+    /**
+     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.
+     *
+     * This function uses the create2 opcode and a `salt` to deterministically deploy
+     * the clone. Using the same `implementation` and `salt` multiple time will revert, since
+     * the clones cannot be deployed twice at the same address.
+     */
+    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes
+            // of the `implementation` address with the bytecode before the address.
+            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))
+            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.
+            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))
+            instance := create2(0, 0x09, 0x37, salt)
+        }
+        require(instance != address(0), "ERC1167: create2 failed");
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(
+        address implementation,
+        bytes32 salt,
+        address deployer
+    ) internal pure returns (address predicted) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40)
+            mstore(add(ptr, 0x38), deployer)
+            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)
+            mstore(add(ptr, 0x14), implementation)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)
+            mstore(add(ptr, 0x58), salt)
+            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))
+            predicted := keccak256(add(ptr, 0x43), 0x55)
+        }
+    }
+
+    /**
+     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.
+     */
+    function predictDeterministicAddress(address implementation, bytes32 salt)
+        internal
+        view
+        returns (address predicted)
+    {
+        return predictDeterministicAddress(implementation, salt, address(this));
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.8.0) (utils/Create2.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Helper to make usage of the `CREATE2` EVM opcode easier and safer.
+ * `CREATE2` can be used to compute in advance the address where a smart
+ * contract will be deployed, which allows for interesting new mechanisms known
+ * as 'counterfactual interactions'.
+ *
+ * See the https://eips.ethereum.org/EIPS/eip-1014#motivation[EIP] for more
+ * information.
+ */
+library Create2 {
+    /**
+     * @dev Deploys a contract using `CREATE2`. The address where the contract
+     * will be deployed can be known in advance via {computeAddress}.
+     *
+     * The bytecode for a contract can be obtained from Solidity with
+     * `type(contractName).creationCode`.
+     *
+     * Requirements:
+     *
+     * - `bytecode` must not be empty.
+     * - `salt` must have not been used for `bytecode` already.
+     * - the factory must have a balance of at least `amount`.
+     * - if `amount` is non-zero, `bytecode` must have a `payable` constructor.
+     */
+    function deploy(
+        uint256 amount,
+        bytes32 salt,
+        bytes memory bytecode
+    ) internal returns (address addr) {
+        require(address(this).balance >= amount, "Create2: insufficient balance");
+        require(bytecode.length != 0, "Create2: bytecode length is zero");
+        /// @solidity memory-safe-assembly
+        assembly {
+            addr := create2(amount, add(bytecode, 0x20), mload(bytecode), salt)
+        }
+        require(addr != address(0), "Create2: Failed on deploy");
+    }
+
+    /**
+     * @dev Returns the address where a contract will be stored if deployed via {deploy}. Any change in the
+     * `bytecodeHash` or `salt` will result in a new destination address.
+     */
+    function computeAddress(bytes32 salt, bytes32 bytecodeHash) internal view returns (address) {
+        return computeAddress(salt, bytecodeHash, address(this));
+    }
+
+    /**
+     * @dev Returns the address where a contract will be stored if deployed via {deploy} from a contract located at
+     * `deployer`. If `deployer` is this contract's address, returns the same value as {computeAddress}.
+     */
+    function computeAddress(
+        bytes32 salt,
+        bytes32 bytecodeHash,
+        address deployer
+    ) internal pure returns (address addr) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let ptr := mload(0x40) // Get free memory pointer
+
+            // |                   | ↓ ptr ...  ↓ ptr + 0x0B (start) ...  ↓ ptr + 0x20 ...  ↓ ptr + 0x40 ...   |
+            // |-------------------|---------------------------------------------------------------------------|
+            // | bytecodeHash      |                                                        CCCCCCCCCCCCC...CC |
+            // | salt              |                                      BBBBBBBBBBBBB...BB                   |
+            // | deployer          | 000000...0000AAAAAAAAAAAAAAAAAAA...AA                                     |
+            // | 0xFF              |            FF                                                             |
+            // |-------------------|---------------------------------------------------------------------------|
+            // | memory            | 000000...00FFAAAAAAAAAAAAAAAAAAA...AABBBBBBBBBBBBB...BBCCCCCCCCCCCCC...CC |
+            // | keccak(start, 85) |            ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑ |
+
+            mstore(add(ptr, 0x40), bytecodeHash)
+            mstore(add(ptr, 0x20), salt)
+            mstore(ptr, deployer) // Right-aligned with 12 preceding garbage bytes
+            let start := add(ptr, 0x0b) // The hashed data starts at the final garbage byte which we will set to 0xff
+            mstore8(start, 0xff)
+            addr := keccak256(start, 85)
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/proxy/Clones.sol";
+
+import "./interfaces/IPrivateFolioV3.sol";
+
+import "./utils/Registry.sol";
+
+contract FolioFactory is Registry, Ownable {
+
+    address private implementation;
+
+    mapping(address => bool) private _folioCreated;
+    mapping(address => bool) private _approvedModules;
+
+    event FolioCreated(
+        address folio,
+        address[] tokens,
+        uint256[] weights,
+        address manager
+    );
+
+    constructor(
+        address _implementation
+    ) {
+        implementation = _implementation;
+    }
+
+    function createFolio(
+        address[] memory tokens,
+        uint256[] memory weights,
+        address tokenContract,
+        uint256 tokenId,
+        address manager, 
+        uint256 salt                                                                                                                                                                                                                                                                                                                                   
+    ) external {
+        bytes memory initData = abi.encodeWithSelector(
+            IPrivateFolioV3.initialize.selector,
+            tokens,
+            weights,
+            manager,
+            address(this)
+        );
+        address proxy = this.createAccount(implementation, block.chainid, tokenContract, tokenId, salt, initData);
+        _folioCreated[proxy] = true;
+        emit FolioCreated(proxy, tokens, weights, manager);
+    }
+
+    function predictAddress(
+        address tokenContract,
+        uint256 tokenId,
+        uint256 salt
+    ) external view returns(address) {
+        return account(implementation, block.chainid, tokenContract, tokenId, salt);
+    }
+
+    function approveModule(
+        address _module
+    ) external onlyOwner {
+        _approvedModules[_module] = true;
+    }
+
+    function checkValidFolio(
+        address folio
+    ) external view returns(bool) {
+        return _folioCreated[folio];
+    }
+
+    function checkApprovedModule(
+        address module
+    ) external view returns(bool) {
+        return _approvedModules[module];
+    }
+
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+
+interface IPrivateFolioV3 {
+
+    event FolioInitialized(
+        address[] tokens,
+        uint256[] weights,
+        address manager
+    );
+
+    function initialize(
+        address[] calldata tokens,
+        uint256[] calldata weights,
+        address manager
+    ) external;
+
+
+    function delegateCall(
+        address _target,
+        bytes calldata _data
+    ) external;
+}
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "@openzeppelin/contracts/utils/Create2.sol";
+
+contract Registry {
+
+    error InitializationFailed();
+
+    function createAccount(
+        address implementation,
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId,
+        uint256 salt,
+        bytes calldata initData
+    ) public returns(address) {
+        bytes memory code = _creationCode(implementation, chainId, tokenContract, tokenId, salt);
+
+        address _account = Create2.computeAddress(
+            bytes32(salt),
+            keccak256(code)
+        );
+
+        if(_account.code.length != 0) return _account;
+
+        _account = Create2.deploy(0, bytes32(salt), code);
+
+        if(initData.length != 0) {
+            (bool success, ) = _account.call(initData);
+            require(success, "ERR: Deploy failed");
+        }
+
+        return _account;
+    }
+
+    function account(
+        address implementation,
+        uint256 chainId,
+        address tokenContract,
+        uint256 tokenId,
+        uint256 salt
+    ) public view returns(address) {
+        bytes32 bytecodeHash = keccak256(
+            _creationCode(implementation, chainId, tokenContract, tokenId, salt)
+        );
+
+        return Create2.computeAddress(bytes32(salt), bytecodeHash);
+    }
+
+    function _creationCode(
+        address implementation_,
+        uint256 chainId_,
+        address tokenContract_,
+        uint256 tokenId_,
+        uint256 salt_
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            hex"3d60ad80600a3d3981f3363d3d373d3d3d363d73",
+            implementation_,
+            hex"5af43d82803e903d91602b57fd5bf3",
+            abi.encode(salt_, chainId_, tokenContract_, tokenId_)
+        );
+    }
+}
