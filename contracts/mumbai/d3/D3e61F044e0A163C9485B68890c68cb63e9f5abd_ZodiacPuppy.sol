@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import {ERC721} from "ERC721.sol";
+import {DefaultOperatorFilterer} from "DefaultOperatorFilterer.sol";
+import {Ownable} from "Ownable.sol";
+import "Counters.sol";
+import "Strings.sol";
+import "ERC2981.sol";
+import "IERC20.sol";
+
+/**
+ * @title  ExampleERC721
+ * @notice This example contract is configured to use the DefaultOperatorFilterer, which automatically registers the
+ *         token and subscribes it to OpenSea's curated filters.
+ *         Adding the onlyAllowedOperator modifier to the transferFrom and both safeTransferFrom methods ensures that
+ *         the msg.sender (operator) is allowed by the OperatorFilterRegistry. Adding the onlyAllowedOperatorApproval
+ *         modifier to the approval methods ensures that owners do not approve operators that are not allowed.
+ */
+contract ZodiacPuppy is ERC721, DefaultOperatorFilterer, Ownable, ERC2981 {
+    using Strings for uint256;
+    using Counters for Counters.Counter;
+
+    IERC20 public token;
+
+    string private baseURI;
+    string public baseExtension = ".json";
+    string public contractURI;
+    string public notRevealedUri;
+
+    bool public public_mint_status = false;
+    bool public revealed = false;
+
+    uint256 public MAX_SUPPLY = 12000;
+    uint256 public publicSaleCost;
+    uint256 public max_per_wallet = 10000;
+    uint256 public max_per_txn = 10000; 
+    uint256 public totalSupply;    
+    uint96 royaltyFeesInBips;
+
+    address royaltyAddress;    
+    address public token_Contract = 0x890A1699965EC715bf99fC665F6fb946ac65687A; //0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619;
+    address public premintwallet = 0x88aBc46a8E2AD63876dcC979D781f0bC5F898081;
+
+    mapping(uint256 => uint256) public count;
+    mapping(uint256 => uint256) public sectionPrice;
+
+    constructor(
+        string memory _name,
+        string memory _symbol,
+        string memory _initBaseURI,
+        string memory _initNotRevealedUri
+        
+    ) ERC721(_name, _symbol) {
+        setBaseURI(_initBaseURI);
+        setNotRevealedURI(_initNotRevealedUri);   
+        setRoyaltyInfo(owner(),500);
+        token = IERC20(token_Contract);
+    }
+
+    function preMintNFTs(uint256 startingID, uint256 endingID) public onlyOwner {
+        for (uint256 i = startingID; i <= endingID; i++) {
+            _safeMint(premintwallet, i);
+            totalSupply++;
+        }        
+    }
+
+    function bulkPreMintNFTs(uint256[] memory startingIDs, uint256[] memory endingIDs) external onlyOwner {
+        for (uint256 i = 0; i < 24; i++) {
+            preMintNFTs(startingIDs[i], endingIDs[i]);
+         }
+    }
+
+    function mint(uint256 _mintAmount, uint256 _priceSection) public payable {
+    require(totalSupply + _mintAmount <= MAX_SUPPLY, "Maximum supply exceeds");
+        
+    uint256 startTokenId;
+    uint256 endTokenId;
+    
+    // Define the start and end token IDs based on the selected price section
+    if (_priceSection == 1) {
+        startTokenId = 76;
+        endTokenId = 200;        
+    } else if (_priceSection == 2) {
+        startTokenId = 502;
+        endTokenId = 1000;
+    } else if (_priceSection == 3) {
+        startTokenId = 1077;
+        endTokenId = 1200;
+    } else if (_priceSection == 4) {
+        startTokenId = 1502;
+        endTokenId = 2000;
+    } else if (_priceSection == 5) {
+        startTokenId = 2077;
+        endTokenId = 2200;
+    } else if (_priceSection == 6) {
+        startTokenId = 2502;
+        endTokenId = 3000;
+    } else if (_priceSection == 7) {
+        startTokenId = 3077;
+        endTokenId = 3200;
+    } else if (_priceSection == 8) {
+        startTokenId = 3502;
+        endTokenId = 4000;
+    } else if (_priceSection == 9) {
+        startTokenId = 4077;
+        endTokenId = 4200;
+    } else if (_priceSection == 10) {
+        startTokenId = 4502;
+        endTokenId = 5000;
+    } else if (_priceSection == 11) {
+        startTokenId = 5077;
+        endTokenId = 5200;
+    } else if (_priceSection == 12) {
+        startTokenId = 5502;
+        endTokenId = 6000;
+    } else if (_priceSection == 13) {
+        startTokenId = 6077;
+        endTokenId = 6200;
+    } else if (_priceSection == 14) {
+        startTokenId = 6502;
+        endTokenId = 7000;
+    } else if (_priceSection == 15) {
+        startTokenId = 7077;
+        endTokenId = 7200;
+    } else if (_priceSection == 16) {
+        startTokenId = 7502;
+        endTokenId = 8000;
+    } else if (_priceSection == 17) {
+        startTokenId = 8077;
+        endTokenId = 8200;
+    } else if (_priceSection == 18) {
+        startTokenId = 8502;
+        endTokenId = 9000;
+    } else if (_priceSection == 19) {
+        startTokenId = 9077;
+        endTokenId = 9200;
+    } else if (_priceSection == 20) {
+        startTokenId = 9502;
+        endTokenId = 10000;
+    } else if (_priceSection == 21) {
+        startTokenId = 10077;
+        endTokenId = 10200;
+    } else if (_priceSection == 22) {
+        startTokenId = 10502;
+        endTokenId = 11000;
+    } else if (_priceSection == 23) {
+        startTokenId = 11077;
+        endTokenId = 11200;
+    } else if (_priceSection == 24) {
+        startTokenId = 11502;
+        endTokenId = 12000;
+    } else {
+        revert("Invalid price section");
+    }
+    
+    publicSaleCost = sectionPrice[_priceSection];
+
+    if (msg.sender != owner()) {
+        require(public_mint_status, "Public mint not available");
+        require(_mintAmount + balanceOf(msg.sender) <= max_per_wallet, "Max per wallet exceeds");
+        require(_mintAmount <= max_per_txn, "Per txn Limit Reached");
+        require(token.balanceOf(msg.sender) >= (publicSaleCost * 10 ** 9) * _mintAmount, "You do not have enough tokens to perform the transaction");
+        token.transferFrom(msg.sender, owner(), (publicSaleCost * 10 ** 9) * _mintAmount);
+    }
+
+    for (uint256 i = 0; i < _mintAmount; i++) {
+        uint256 tokenId = startTokenId + count [_priceSection];
+        
+        if (tokenId >= startTokenId && tokenId <= endTokenId) {
+            if (!_exists(tokenId)) {
+                count[_priceSection]++;
+                totalSupply++;
+                _safeMint(msg.sender, tokenId);                
+            } else {
+                tokenId++;
+                count [_priceSection]++;
+                totalSupply++;
+                _safeMint(msg.sender, tokenId);               
+            }
+        } else {
+            revert("Token ID not within the selected price section");
+        }
+        
+    }
+
+}
+
+
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        virtual
+        override
+        returns (string memory)
+    {
+        _requireMinted(tokenId);
+
+        require(
+            _exists(tokenId),
+            "ERC721Metadata: URI query for nonexistent token"
+        );
+
+        if (revealed == false) {
+            return notRevealedUri;
+        }
+
+        return
+            bytes(baseURI).length > 0
+                ? string(
+                    abi.encodePacked(baseURI, tokenId.toString(), baseExtension)
+                )
+                : "";
+    }
+
+    function setApprovalForAll(address operator, bool approved)
+        public
+        override
+        onlyAllowedOperatorApproval(operator)
+    {
+        super.setApprovalForAll(operator, approved);
+    }
+
+    function approve(address operator, uint256 tokenId)
+        public
+        override
+        onlyAllowedOperatorApproval(operator)
+    {
+        super.approve(operator, tokenId);
+    }
+
+    function transferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public override onlyAllowedOperator(from) {
+        super.transferFrom(from, to, tokenId);
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId
+    ) public override onlyAllowedOperator(from) {
+        super.safeTransferFrom(from, to, tokenId);
+    }
+
+    function setRoyaltyInfo(address _receiver, uint96 _royaltyFeesInBips)
+        public
+        onlyOwner
+    {
+        royaltyAddress = _receiver;
+        royaltyFeesInBips = _royaltyFeesInBips;
+    }
+
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes memory data
+    ) public override onlyAllowedOperator(from) {
+        super.safeTransferFrom(from, to, tokenId, data);
+    }
+
+    function setBaseURI(string memory _newBaseURI) public onlyOwner {
+        baseURI = _newBaseURI;
+    }
+
+    function royaltyInfo(uint256 _tokenId, uint256 _salePrice)
+        public
+        view
+        virtual
+        override
+        returns (address, uint256)
+    {
+        return (royaltyAddress, calculateRoyalty(_salePrice));
+    }
+
+    function calculateRoyalty(uint256 _salePrice)
+        public
+        view
+        returns (uint256)
+    {
+        return (_salePrice / 10000) * royaltyFeesInBips;
+    }
+
+    /**
+     * @dev See {IERC165-supportsInterface}.
+     */
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        virtual
+        override(ERC721, ERC2981)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function setNotRevealedURI(string memory _notRevealedURI) public onlyOwner {
+        notRevealedUri = _notRevealedURI;
+    }
+
+    function setBaseExtension(string memory _newBaseExtension)
+        public
+        onlyOwner
+    {
+        baseExtension = _newBaseExtension;
+    }
+
+    function setPublic_mint_status(bool _public_mint_status) public onlyOwner {
+        public_mint_status = _public_mint_status;
+    }
+
+    function toggleReveal() public onlyOwner {
+        if (revealed == false) {
+            revealed = true;
+        } else {
+            revealed = false;
+        }
+    }
+
+    function setPublicSaleCost(uint256 _publicSaleCost) public onlyOwner {
+        publicSaleCost = _publicSaleCost;
+    }
+
+    function setMax_per_wallet(uint256 _max_per_wallet) public onlyOwner {
+        max_per_wallet = _max_per_wallet;
+    }
+
+    function setMax_per_txn(uint256 _max_per_txn) public onlyOwner {
+        max_per_txn = _max_per_txn;
+    }
+
+    function setRoyaltyAddress(address _royaltyAddress) public onlyOwner {
+        royaltyAddress = _royaltyAddress;
+    }
+
+    function setPremintwallet(address _premintwallet) public onlyOwner {
+        premintwallet = _premintwallet;
+    }
+    
+    function setContractURI(string calldata _contractURI) public onlyOwner {
+        contractURI = _contractURI;
+    }
+
+    function setTokenContract(address _tokenContract) public onlyOwner{
+    token = IERC20(_tokenContract);
+    }
+
+    function setSectionPrice(uint256 sectionNumber, uint256 _price) public onlyOwner {
+        sectionPrice[sectionNumber] = _price;
+    }
+
+    function setBulkSetPrice(uint256[] memory _price) public onlyOwner {
+        for(uint256 x = 1; x <= 24; x++){
+        sectionPrice[x] = _price[x-1];
+        
+        }
+    }
+
+}
