@@ -1,0 +1,598 @@
+// SPDX-License-Identifier: MIT
+
+//                 ____    ____
+//                /\___\  /\___\
+//       ________/ /   /_ \/___/
+//      /\_______\/   /__\___\
+//     / /       /       /   /
+//    / /   /   /   /   /   /
+//   / /   /___/___/___/___/
+//  / /   /
+//  \/___/
+
+pragma solidity 0.8.19;
+
+import { ERC2771Context } from "@gelatonetwork/relay-context/contracts/vendor/ERC2771Context.sol";
+import { BaseCraft } from "./utils/BaseCraft.sol";
+
+import { IMaterialObject } from "./interfaces/IMaterialObject.sol";
+import { IUGCObject } from "./interfaces/IUGCObject.sol";
+import { ICatalyst } from "./interfaces/ICatalyst.sol";
+
+/// @title UGCCraftLogic
+/// @dev The UGCCraftLogic smart contract enables the creation, update, and execution of crafting recipes
+// It also supports actions performed on behalf of users by a trusted relay service.
+contract UGCCraftLogic is BaseCraft, ERC2771Context {
+    /* -------------------------------------------------------------------------- */
+    /*                                   EVENTS                                   */
+    /* -------------------------------------------------------------------------- */
+
+    // Event that is emitted when a new artifact is crafted
+    event Crafted(address indexed crafter, uint256 recipeId, string recipeName);
+    // Event that is emitted when a new recipe is created
+    event RecipeCreated(uint256 indexed recipeId, string name, address indexed owner);
+    // Event that is emitted when a new recipe is created
+    event RecipeUpdated(uint256 indexed recipeId, string name, address indexed owner);
+    // Event that is emitted when a new recipe is created
+    event ChangeRecipeStatus(uint256 indexed recipeId, bool active, address indexed owner);
+    /* -------------------------------------------------------------------------- */
+    /*                                   ERRORS                                   */
+    /* -------------------------------------------------------------------------- */
+
+    // The error thrown when trying to create a recipe that already exists.
+    error ExistentCraft(uint256 id);
+    // The error thrown when trying to update a recipe that doesn't exist.
+    error NonExistentCraft(uint256 id);
+    // The error thrown when trying to create or update a recipe without any materials.
+    error EmptyMaterialsArray();
+    // The error thrown when trying to create or update a recipe without any artifacts.
+    error EmptyArtifactsArray();
+    // The error thrown when trying to craft using an inactive recipe.
+    error RecipeInactive(uint256 recipeId);
+    // The error thrown when the required condition for a catalyst is not satisfied during crafting.
+    error CatalystConditionNotSatisfied();
+    // The error thrown when the name of the recipe is too long.
+    error NameTooLong();
+    // The error thrown when an invalid address is provided. The reason for invalidity is provided as a parameter.
+    error InvalidAddress(string reason);
+    // Error to throw if the function call is not made by an GelatoRelay.
+    error OnlyGelatoRelay();
+    // Error thrown when the caller is not the owner.
+    error NotOwner();
+    // Error thrown when the caller is not the creator of the recipe.
+    error NotRecipeCreator(uint256 recipeId);
+    /* --------------------------------- ****** --------------------------------- */
+
+    /* -------------------------------------------------------------------------- */
+    /*                               INITIALIZATION                               */
+    /* -------------------------------------------------------------------------- */
+    constructor(address trustedForwarder) ERC2771Context(trustedForwarder) { }
+
+    /* --------------------------------- ****** --------------------------------- */
+
+    /* -------------------------------------------------------------------------- */
+    /*                                  MODIFIERS                                 */
+    /* -------------------------------------------------------------------------- */
+
+    modifier onlyRecipeCreator(uint256 recipeId) {
+        if (_msgSender() != recipes[recipeId].creator) revert NotRecipeCreator(recipeId);
+        _;
+    }
+
+    /* --------------------------------- ****** --------------------------------- */
+
+    /* -------------------------------------------------------------------------- */
+    /*                                    Craft                                   */
+    /* -------------------------------------------------------------------------- */
+    // 0:ERC20,1:ERC721,2:ERC1155
+    function _checkCatalystCondition(Catalyst memory catalyst) internal view {
+        if (catalyst.tokenType == 0 && !enoughERC20Balance(catalyst)) {
+            revert CatalystConditionNotSatisfied();
+        } else if (catalyst.tokenType == 1 && !correctERC721Owner(catalyst)) {
+            revert CatalystConditionNotSatisfied();
+        } else if (catalyst.tokenType == 2 && !enoughERC1155Balance(catalyst)) {
+            revert CatalystConditionNotSatisfied();
+        }
+    }
+
+    function enoughERC20Balance(Catalyst memory catalyst) internal view returns (bool) {
+        return ICatalyst(catalyst.tokenAddress).balanceOf(_msgSender()) >= catalyst.amount;
+    }
+
+    function correctERC721Owner(Catalyst memory catalyst) internal view returns (bool) {
+        return ICatalyst(catalyst.tokenAddress).ownerOf(catalyst.tokenid) == _msgSender();
+    }
+
+    function enoughERC1155Balance(Catalyst memory catalyst) internal view returns (bool) {
+        return ICatalyst(catalyst.tokenAddress).balanceOf(_msgSender(), catalyst.tokenid) >= catalyst.amount;
+    }
+
+    /**
+     * @dev This function allows users to craft an artifact given a recipeId.
+     * The function first checks if the recipe is active and satisfies the catalyst condition,
+     * then it burns the required materials and mints the new artifact.
+     *
+     * @param recipeId ID of the recipe to be used for crafting.
+     */
+    function craft(uint256 recipeId) external override nonReentrant {
+        _craft(recipeId);
+    }
+
+    function _craft(uint256 recipeId) private {
+        // Retrieve the recipe
+        Recipe storage recipe = recipes[recipeId];
+
+        // Ensure the recipe is active
+        if (!recipe.active) revert RecipeInactive(recipeId);
+
+        // Check catalyst condition
+        Catalyst memory catalyst = recipe.catalyst;
+        if (catalyst.tokenAddress != address(0)) {
+            _checkCatalystCondition(catalyst);
+        }
+
+        // Burn the required materials
+        uint256 materialsLength = recipe.materials.length;
+        for (uint256 i = 0; i < materialsLength;) {
+            Material memory material = recipe.materials[i];
+            IMaterialObject(material.tokenAddress).burnObject(_msgSender(), material.tokenid, material.amount);
+            unchecked {
+                ++i;
+            }
+        }
+
+        // Mint the artifacts
+        uint256 artifactsLength = recipe.artifacts.length;
+        for (uint256 i = 0; i < artifactsLength;) {
+            Artifacts memory artifact = recipe.artifacts[i];
+            IUGCObject(artifact.tokenAddress).craftObject(_msgSender(), artifact.tokenid, artifact.amount);
+            unchecked {
+                ++i;
+            }
+        }
+        // Emit the Crafted event
+        emit Crafted(_msgSender(), recipeId, recipe.name);
+    }
+
+    /**
+     * @dev This function creates a new recipe. It checks if the recipe already exists,
+     * ensures that the materials and artifacts arrays have at least one element,
+     * and emits a RecipeCreated event.
+     *
+     * Requirements:
+     * - The caller must be the owner.
+     * - The materials and artifacts arrays must not be empty.
+     *
+     * @param name the name of the recipe
+     * @param materials the materials required for the recipe
+     * @param artifacts the artifacts produced by the recipe
+     * @param catalyst the catalyst required for the recipe
+     */
+    function createRecipe(
+        string calldata name,
+        Material[] calldata materials,
+        Artifacts[] calldata artifacts,
+        Catalyst calldata catalyst
+    )
+        external
+        override
+    {
+        uint256 id = getRecipeNumber() + 1;
+        _createOrUpdateRecipe(id, name, materials, artifacts, catalyst, true, false);
+        ++recipeCount;
+    }
+
+    /**
+     * @dev This function updates an existing recipe. It checks if the recipe exists,
+     * ensures that the materials and artifacts arrays have at least one element,
+     * and emits a RecipeUpdated event.
+     *
+     * Requirements:
+     * - The caller must be the owner.
+     * - The materials and artifacts arrays must not be empty.
+     *
+     * @param recipeId the ID of the recipe to update
+     * @param name the name of the recipe
+     * @param materials the materials required for the recipe
+     * @param artifacts the artifacts produced by the recipe
+     * @param catalyst the catalyst required for the recipe
+     * @param active the status of the recipe
+     */
+    function updateRecipe(
+        uint256 recipeId,
+        string memory name,
+        Material[] memory materials,
+        Artifacts[] memory artifacts,
+        Catalyst calldata catalyst,
+        bool active
+    )
+        external
+        override
+        onlyRecipeCreator(recipeId)
+    {
+        _createOrUpdateRecipe(recipeId, name, materials, artifacts, catalyst, active, true);
+    }
+
+    function _createOrUpdateRecipe(
+        uint256 recipeId,
+        string memory name,
+        Material[] memory materials,
+        Artifacts[] memory artifacts,
+        Catalyst calldata catalyst,
+        bool active,
+        bool isUpdate // true:= update, false:= create
+    )
+        internal
+    {
+        // Check if the recipe already exists
+        if (recipes[recipeId].id == recipeId && !isUpdate) revert ExistentCraft(recipeId);
+        if (recipes[recipeId].id != recipeId && isUpdate) revert NonExistentCraft(recipeId);
+
+        uint256 materialsLength = materials.length;
+        uint256 artifactsLength = artifacts.length;
+        // Check that materials and artifacts arrays have at least one element
+        if (materialsLength == 0) revert EmptyMaterialsArray();
+        if (artifactsLength == 0) revert EmptyArtifactsArray();
+
+        // Update or Create a new recipe
+        Recipe storage recipe = recipes[recipeId];
+        recipe.id = recipeId;
+        recipe.name = name;
+        recipe.catalyst = catalyst;
+        recipe.creator = msg.sender;
+        recipe.active = active;
+
+        // Update the materials array
+        delete recipe.materials;
+        for (uint256 i = 0; i < materialsLength;) {
+            recipe.materials.push(materials[i]);
+            unchecked {
+                ++i;
+            }
+        }
+
+        // Update the artifacts array
+        delete recipe.artifacts;
+        for (uint256 i = 0; i < artifactsLength;) {
+            recipe.artifacts.push(artifacts[i]);
+            unchecked {
+                ++i;
+            }
+        }
+        // Emit the RecipeCreated event
+        if (isUpdate) {
+            emit RecipeUpdated(recipeId, name, _msgSender());
+        } else {
+            emit RecipeCreated(recipeId, name, _msgSender());
+        }
+    }
+
+    /**
+     * @dev This function changes the status of an existing recipe. It checks if the recipe exists,
+     * and emits a ChangeRecipeStatus event.
+     *
+     * Requirements:
+     * - The caller must be the owner.
+     *
+     * @param recipeId the ID of the recipe to update
+     * @param active the new status of the recipe
+     */
+    function changeRecipeStatus(uint256 recipeId, bool active) external override onlyRecipeCreator(recipeId) {
+        // Check if the recipe already exists
+        if (recipes[recipeId].id != recipeId) revert NonExistentCraft(recipeId);
+
+        // Update
+        Recipe storage recipe = recipes[recipeId];
+        recipe.active = active;
+        // Emit the RecipeCreated event
+        emit ChangeRecipeStatus(recipeId, active, _msgSender());
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                               RelayCraft                                  */
+    /* -------------------------------------------------------------------------- */
+    address constant GELATO_RELAY = 0xd8253782c45a12053594b9deB72d8e8aB2Fca54c;
+
+    modifier onlyGelatoRelay() {
+        if (!_isGelatoRelay(msg.sender)) revert OnlyGelatoRelay();
+        _;
+    }
+
+    function _isGelatoRelay(address _forwarder) internal pure returns (bool) {
+        return _forwarder == GELATO_RELAY;
+    }
+
+    // Function to craft object by relayer.
+    function craftByRelayer(uint256 recipeId) external onlyGelatoRelay nonReentrant {
+        _craft(recipeId);
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.7.0) (metatx/ERC2771Context.sol)
+
+pragma solidity ^0.8.1;
+
+/**
+ * @dev Context variant with ERC2771 support.
+ */
+// based on https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/metatx/ERC2771Context.sol
+abstract contract ERC2771Context {
+    address private immutable _trustedForwarder;
+
+    constructor(address trustedForwarder) {
+        _trustedForwarder = trustedForwarder;
+    }
+
+    function isTrustedForwarder(address forwarder)
+        public
+        view
+        virtual
+        returns (bool)
+    {
+        return forwarder == _trustedForwarder;
+    }
+
+    function _msgSender() internal view virtual returns (address sender) {
+        if (isTrustedForwarder(msg.sender)) {
+            // The assembly code is more direct than the Solidity version using `abi.decode`.
+            /// @solidity memory-safe-assembly
+            assembly {
+                sender := shr(96, calldataload(sub(calldatasize(), 20)))
+            }
+        } else {
+            return msg.sender;
+        }
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        if (isTrustedForwarder(msg.sender)) {
+            return msg.data[:msg.data.length - 20];
+        } else {
+            return msg.data;
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import { ReentrancyGuard } from "@openzeppelin/security/ReentrancyGuard.sol";
+
+abstract contract BaseCraft is ReentrancyGuard {
+    /* -------------------------------------------------------------------------- */
+    /*                                   STORAGE                                  */
+    /* -------------------------------------------------------------------------- */
+    uint256 public recipeCount;
+
+    // Define an array to store the recipes
+    mapping(uint256 => Recipe) internal recipes;
+
+    struct Material {
+        address tokenAddress; // The address of the ERC1155 contract for this material
+        uint256 tokenid; // The ID of the token in the ERC1155 contract
+        uint256 amount; // The amount of the token required
+    }
+
+    struct Artifacts {
+        address tokenAddress; // The address of the ERC1155 contract for this Artifacts
+        uint256 tokenid; // The ID of the token in the ERC1155 contract
+        uint256 amount; // The amount of the token required
+    }
+
+    struct Catalyst {
+        address tokenAddress; // The address of the ERC20/721/1155 contract for this catalyst
+        uint256 tokenid; // The ID of the token in the contract : ERC20 => 0
+        uint256 amount; // The required balance of the token
+        uint8 tokenType; // Type of the token: 0 = ERC20, 1 = ERC721, 2 = ERC1155
+    }
+
+    struct Recipe {
+        uint256 id;
+        string name;
+        Material[] materials;
+        Artifacts[] artifacts;
+        Catalyst catalyst; //erc 20/ erc721/ erc1155
+        address creator;
+        bool active;
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*                               ABSTRACT METHODS                             */
+    /* -------------------------------------------------------------------------- */
+    /**
+     * @dev This function returns the Recipe structure for a given recipeId.
+     *
+     * @param recipeId ID of the recipe to be retrieved.
+     */
+
+    function getRecipe(uint256 recipeId) external view virtual returns (Recipe memory recipe) {
+        return recipes[recipeId];
+    }
+
+    // These methods need to be implemented by subclasses
+    function getRecipeNumber() public view returns (uint256) {
+        return recipeCount;
+    }
+
+    function craft(uint256 recipeId) external virtual;
+    function createRecipe(
+        string calldata name,
+        Material[] calldata materials,
+        Artifacts[] calldata artifacts,
+        Catalyst calldata catalyst
+    )
+        external
+        virtual;
+
+    function updateRecipe(
+        uint256 recipeId,
+        string memory name,
+        Material[] memory materials,
+        Artifacts[] memory artifacts,
+        Catalyst calldata catalyst,
+        bool active
+    )
+        external
+        virtual;
+    function changeRecipeStatus(uint256 recipeId, bool active) external virtual;
+}
+
+// SPDX-License-Identifier: MIT
+
+//                 ____    ____
+//                /\___\  /\___\
+//       ________/ /   /_ \/___/
+//      /\_______\/   /__\___\
+//     / /       /       /   /
+//    / /   /   /   /   /   /
+//   / /   /___/___/___/___/
+//  / /   /
+//  \/___/
+
+pragma solidity 0.8.19;
+
+interface IMaterialObject {
+    struct Size {
+        uint8 x;
+        uint8 y;
+        uint8 z;
+    }
+
+    function getSize(uint256 tokenId) external view returns (Size memory);
+
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes memory data) external;
+
+    function getObject(address to, uint256 tokenid, uint256 amount) external;
+
+    function burnObject(address from, uint256 tokenid, uint256 amount) external;
+
+    function burnBatchObject(address from, uint256[] memory ids, uint256[] memory amounts) external;
+}
+
+// SPDX-License-Identifier: MIT
+
+//                 ____    ____
+//                /\___\  /\___\
+//       ________/ /   /_ \/___/
+//      /\_______\/   /__\___\
+//     / /       /       /   /
+//    / /   /   /   /   /   /
+//   / /   /___/___/___/___/
+//  / /   /
+//  \/___/
+
+pragma solidity 0.8.19;
+
+interface IUGCObject {
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+
+    function craftObject(address to, uint256 tokenId, uint256 amount) external;
+
+    function burnObject(address from, uint256 tokenid, uint256 amount) external;
+
+    function burnBatchObject(address from, uint256[] memory ids, uint256[] memory amounts) external;
+}
+
+// SPDX-License-Identifier: MIT
+
+//                 ____    ____
+//                /\___\  /\___\
+//       ________/ /   /_ \/___/
+//      /\_______\/   /__\___\
+//     / /       /       /   /
+//    / /   /   /   /   /   /
+//   / /   /___/___/___/___/
+//  / /   /
+//  \/___/
+
+pragma solidity 0.8.19;
+
+interface ICatalyst {
+    function balanceOf(address account) external view returns (uint256);
+
+    function ownerOf(uint256 tokenId) external view returns (address);
+
+    function balanceOf(address account, uint256 id) external view returns (uint256);
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v4.9.0) (security/ReentrancyGuard.sol)
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ *
+ * TIP: If you would like to learn more about reentrancy and alternative ways
+ * to protect against it, check out our blog post
+ * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].
+ */
+abstract contract ReentrancyGuard {
+    // Booleans are more expensive than uint256 or any type that takes up a full
+    // word because each write operation emits an extra SLOAD to first read the
+    // slot's contents, replace the bits taken up by the boolean, and then write
+    // back. This is the compiler's defense against contract upgrades and
+    // pointer aliasing, and it cannot be disabled.
+
+    // The values being non-zero value makes deployment a bit more expensive,
+    // but in exchange the refund on every call to nonReentrant will be lower in
+    // amount. Since refunds are capped to a percentage of the total
+    // transaction's gas, it is best to keep them low in cases like this one, to
+    // increase the likelihood of the full refund coming into effect.
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _nonReentrantBefore();
+        _;
+        _nonReentrantAfter();
+    }
+
+    function _nonReentrantBefore() private {
+        // On the first call to nonReentrant, _status will be _NOT_ENTERED
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+    }
+
+    function _nonReentrantAfter() private {
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Returns true if the reentrancy guard is currently set to "entered", which indicates there is a
+     * `nonReentrant` function in the call stack.
+     */
+    function _reentrancyGuardEntered() internal view returns (bool) {
+        return _status == _ENTERED;
+    }
+}
